@@ -82,7 +82,7 @@ invalid values are rejected without changing anything.
 | Section | What to set |
 | --- | --- |
 | **Connection and privacy** | Ollama URL (default `http://127.0.0.1:11434`). Remote or cloud model endpoints are blocked unless you allow them. Turn on web fetch and search tools here, and optionally a SearXNG URL, a text browser for search, and the local sites address. |
-| **Tools and command approvals** | Enable workspace tools (files, commands, terminals). Choose what may run without asking: web actions, file changes (always backed up and restorable), commands. Everything else shows a preview to approve. |
+| **Tools and command approvals** | Enable workspace tools (files, commands, terminals). Choose what may run without asking: web actions, file changes (always backed up and restorable), commands. Set the command sandbox (auto, required or off), its network access and the folders it may read. Everything else shows a preview to approve. |
 | **Appearance** | Light/Dark theme and interface scale (`Ctrl+Shift+T` toggles the theme). |
 | **Generation and context** | Temperature, context size, output limit, thinking mode, tool rounds. Larger contexts need more memory. |
 | **Instructions, memory and agents** | System instruction, your own standing preferences, automatic memory, and supervised subagents. |
@@ -108,12 +108,28 @@ Turn on **Enable explicit web fetch and search tools**, then use any one of:
 Every search is shown for approval unless web actions are set to approve
 automatically. Details: [docs/WEB_SEARCH.md](docs/WEB_SEARCH.md).
 
-### Terminals and commands
+### Terminals, commands and the sandbox
 
 With workspace tools on, the assistant can run one-off commands or open a
 persistent Bash terminal and type into it. Each command, keystroke batch or
 terminal action needs your approval unless you enable automatic approval for
-commands. They run with your user's permissions; they are **not sandboxed**.
+commands.
+
+Commands and terminals the assistant opens run in a
+[bubblewrap](https://github.com/containers/bubblewrap) sandbox
+(**Settings → Tools and command approvals → Command sandbox**):
+
+- they can change files only in the project folder;
+- they see an empty home folder, except read-only tool folders you list
+  (by default `~/.cargo/bin`, `~/.rustup`, `~/.local/bin`);
+- they have no network unless you allow it, and a cleared environment, so API
+  keys in your environment are not passed in.
+
+**Auto** (the default) sandboxes whenever bubblewrap is installed and runs
+commands unsandboxed otherwise, saying so in the approval preview. **Required**
+refuses to run commands without the sandbox. **Off** runs them with your normal
+permissions. Terminals you open yourself, and adapters, MCP servers and external
+agents you configure, are not sandboxed. `setup.sh` installs bubblewrap.
 
 ### Data, backups and crash reports
 

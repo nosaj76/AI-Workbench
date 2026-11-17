@@ -240,9 +240,18 @@ enum SearchProvider {
     },
 }
 
+/// How the engine isolates commands and terminals the model proposes.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxSettings {
+    pub mode: crate::sandbox::SandboxMode,
+    pub network: bool,
+    pub read_only: Vec<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct ToolEngine {
     workspace: Arc<Workspace>,
+    sandbox: Arc<Mutex<SandboxSettings>>,
     terminals: crate::terminal::TerminalManager,
     unread_terminal_output: Arc<Mutex<HashMap<String, u64>>>,
     backup_root: PathBuf,
@@ -281,6 +290,12 @@ impl ToolEngine {
     pub fn with_backup_dir(workspace: Workspace, backup_root: PathBuf) -> Self {
         Self {
             workspace: Arc::new(workspace),
+            // Unit tests and bare engines run commands directly; the desktop
+            // configures the sandbox from Settings (auto by default).
+            sandbox: Arc::new(Mutex::new(SandboxSettings {
+                mode: crate::sandbox::SandboxMode::Off,
+                ..Default::default()
+            })),
             terminals: crate::terminal::TerminalManager::default(),
             unread_terminal_output: Arc::new(Mutex::new(HashMap::new())),
             external_runs: backup_root.join("external-agent-runs"),
@@ -383,6 +398,38 @@ impl ToolEngine {
     fn workspace_tools_enabled(&self) -> bool {
         self.workspace_tools_enabled.load(Ordering::Relaxed)
     }
+    pub fn set_sandbox(&self, settings: SandboxSettings) {
+        if let Ok(mut current) = self.sandbox.lock() {
+            *current = settings;
+        }
+    }
+
+    /// The policy for the next model-proposed command or terminal, if any.
+    pub(super) fn command_sandbox(&self) -> Result<Option<crate::sandbox::SandboxPolicy>> {
+        let settings = self
+            .sandbox
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sandbox settings lock failed"))?
+            .clone();
+        let policy = || {
+            crate::sandbox::SandboxPolicy::for_workspace(
+                self.root(),
+                &settings.read_only,
+                settings.network,
+            )
+        };
+        Ok(match settings.mode {
+            crate::sandbox::SandboxMode::Off => None,
+            crate::sandbox::SandboxMode::Auto => crate::sandbox::available().then(policy),
+            crate::sandbox::SandboxMode::Required => {
+                if !crate::sandbox::available() {
+                    bail!("The command sandbox is required but bubblewrap cannot create one here. Install bubblewrap (bwrap) or change Settings → Tools → Command sandbox. Nothing was run.");
+                }
+                Some(policy())
+            }
+        })
+    }
+
     pub fn set_local_sites_url(&self, url: Option<String>) -> Result<()> {
         if let Some(url) = url.as_ref() {
             integrations::validate_http_url(url)?;
@@ -954,7 +1001,7 @@ fn definition(name: &str, description: &str, properties: Value, required: &[&str
 }
 
 fn command_preview(spec: &CommandSpec) -> Value {
-    json!({"program":spec.program,"args":spec.args,"command":spec.display_command(),"cwd":spec.cwd,"timeout_secs":spec.timeout_secs,"max_output_bytes":spec.max_output_bytes,"stdin_text":spec.stdin_text,"environment_keys":spec.env.keys().collect::<Vec<_>>(),"sandboxed":false})
+    json!({"program":spec.program,"args":spec.args,"command":spec.display_command(),"cwd":spec.cwd,"timeout_secs":spec.timeout_secs,"max_output_bytes":spec.max_output_bytes,"stdin_text":spec.stdin_text,"environment_keys":spec.env.keys().collect::<Vec<_>>(),"sandbox":spec.sandbox.as_ref().map(|p| p.summary()).unwrap_or(json!({"sandboxed":false}))})
 }
 
 /// `read_limited` for a file inside the workspace: on Linux it is opened beneath the
@@ -1999,6 +2046,53 @@ mod tests {
         assert!(!result.to_string().contains(".env"), "{result}");
         assert!(!result.to_string().contains("ignored.txt"), "{result}");
         assert!(e.prepare("read_file", &json!({"path":".env"})).is_err());
+    }
+
+    #[test]
+    fn sandboxed_commands_change_only_the_project_and_say_so_in_the_preview() {
+        if !crate::sandbox::available() {
+            eprintln!("bubblewrap unavailable; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_sandbox(SandboxSettings {
+            mode: crate::sandbox::SandboxMode::Required,
+            ..Default::default()
+        });
+        let script = format!(
+            "echo inside > made.txt; echo escaped > {}/x 2>/dev/null || echo blocked",
+            outside.path().display()
+        );
+        let a = approval(
+            e.prepare("run_command", &json!({"program":"sh","args":["-c",script]}))
+                .unwrap(),
+        );
+        assert_eq!(a.details["sandbox"]["sandboxed"], true);
+        assert_eq!(a.details["sandbox"]["network"], false);
+        assert!(a.description.contains("sandbox"), "{}", a.description);
+        let result = e.approve(&a).unwrap();
+        assert!(result.to_string().contains("blocked"), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("made.txt")).unwrap(),
+            "inside\n"
+        );
+        assert!(!outside.path().join("x").exists());
+    }
+
+    #[test]
+    fn sandbox_off_keeps_the_unsandboxed_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        let a = approval(
+            e.prepare("run_command", &json!({"program":"true"}))
+                .unwrap(),
+        );
+        assert_eq!(a.details["sandbox"]["sandboxed"], false);
+        assert!(a.description.contains("not sandboxed"));
     }
 
     #[test]

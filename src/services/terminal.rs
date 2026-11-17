@@ -31,6 +31,9 @@ pub struct TerminalConfig {
     pub env: BTreeMap<String, String>,
     pub rows: u16,
     pub cols: u16,
+    /// Run the session inside bubblewrap (terminals the model opens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::sandbox::SandboxPolicy>,
 }
 
 impl Default for TerminalConfig {
@@ -43,6 +46,7 @@ impl Default for TerminalConfig {
             env: BTreeMap::new(),
             rows: 28,
             cols: 100,
+            sandbox: None,
         }
     }
 }
@@ -83,6 +87,9 @@ pub struct TerminalSummary {
     pub pid: u32,
     pub alive: bool,
     pub exit_code: Option<i32>,
+    /// The session runs inside the bubblewrap sandbox.
+    #[serde(default)]
+    pub sandboxed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +243,7 @@ struct TerminalSession {
     stop: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
     exit_code: Mutex<Option<i32>>,
+    sandboxed: bool,
 }
 
 #[derive(Default)]
@@ -334,9 +342,22 @@ impl TerminalManager {
         }
         crate::integrations::nonblocking(&master)?;
         let mut reader = master.try_clone()?;
-        let mut command = Command::new(&config.program);
+        let sandboxed = config.sandbox.is_some();
+        let (program, args) = match &config.sandbox {
+            Some(policy) => {
+                // The sandbox clears the environment; keep the terminal's own settings.
+                let mut env = config.env.clone();
+                env.insert("TERM".into(), "xterm-256color".into());
+                env.insert("COLORTERM".into(), "truecolor".into());
+                env.insert("COLUMNS".into(), config.cols.to_string());
+                env.insert("LINES".into(), config.rows.to_string());
+                policy.wrap(&config.program, &config.args, &cwd, &env, true)?
+            }
+            None => (config.program.clone(), config.args.clone()),
+        };
+        let mut command = Command::new(&program);
         command
-            .args(&config.args)
+            .args(&args)
             .current_dir(&cwd)
             .envs(&config.env)
             .env("TERM", "xterm-256color")
@@ -389,6 +410,7 @@ impl TerminalManager {
             stop: stop.clone(),
             output_closed: output_closed.clone(),
             exit_code: Mutex::new(None),
+            sandboxed,
         });
         let output_state = state.clone();
         let output_stop = stop.clone();
@@ -891,6 +913,7 @@ impl TerminalSession {
                 .exit_code
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Terminal process unavailable"))?,
+            sandboxed: self.sandboxed,
         })
     }
     fn terminate(&self) {

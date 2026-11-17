@@ -5,6 +5,11 @@ pub fn configured_engine(
     workspace: crate::files::Workspace,
 ) -> Result<ToolEngine> {
     let engine = ToolEngine::new(workspace);
+    engine.set_sandbox(crate::tools::SandboxSettings {
+        mode: crate::sandbox::SandboxMode::parse(&settings.command_sandbox)?,
+        network: settings.sandbox_network,
+        read_only: crate::sandbox::parse_paths(&settings.sandbox_read_only_paths),
+    });
     engine.set_network_enabled(settings.network_tools);
     engine.set_knowledge_search(settings.knowledge_search);
     if settings.network_tools && !settings.searxng_url.trim().is_empty() {

@@ -101,6 +101,10 @@ pub mod studio_ui;
 #[path = "services/terminal.rs"]
 pub mod terminal;
 
+/// Bubblewrap isolation for model-proposed commands and terminals.
+#[path = "services/sandbox.rs"]
+pub mod sandbox;
+
 #[path = "workspace/tools/mod.rs"]
 pub mod tools;
 

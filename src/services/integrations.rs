@@ -31,6 +31,9 @@ pub struct CommandSpec {
     pub stdin_text: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Run inside bubblewrap with this access instead of the user's full permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::sandbox::SandboxPolicy>,
 }
 
 fn default_timeout() -> u64 {
@@ -50,6 +53,7 @@ impl Default for CommandSpec {
             max_output_bytes: default_output_limit(),
             stdin_text: None,
             env: BTreeMap::new(),
+            sandbox: None,
         }
     }
 }
@@ -227,8 +231,8 @@ fn capture<R: Read>(
     Ok((captured, truncated))
 }
 
-/// Executes argv directly, with bounded capture and deadline. This is not a sandbox.
-/// A user-approved command has the current user's ordinary OS permissions.
+/// Executes argv directly, with bounded capture and deadline. Without a
+/// `sandbox` policy a command has the current user's ordinary OS permissions.
 pub fn run_command(spec: &CommandSpec, default_cwd: &Path) -> Result<CommandResult> {
     run_command_cancellable(spec, default_cwd, None)
 }
@@ -261,9 +265,13 @@ pub fn run_command_streaming(
         );
     }
     let cap = spec.max_output_bytes.clamp(1024, MAX_CAPTURE);
-    let mut command = Command::new(&spec.program);
+    let (program, args) = match &spec.sandbox {
+        Some(policy) => policy.wrap(&spec.program, &spec.args, cwd, &spec.env, false)?,
+        None => (spec.program.clone(), spec.args.clone()),
+    };
+    let mut command = Command::new(&program);
     command
-        .args(&spec.args)
+        .args(&args)
         .current_dir(cwd)
         .envs(&spec.env)
         .stdin(if spec.stdin_text.is_some() {
