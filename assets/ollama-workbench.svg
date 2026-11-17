@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>AI Workbench</title>
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#171b21"/>
+  <text x="128" y="148" text-anchor="middle" font-family="DejaVu Sans, Liberation Sans, Arial, Helvetica, sans-serif" font-size="118" font-weight="bold" letter-spacing="2" fill="#6fc2ce">AI</text>
+  <rect x="52" y="168" width="152" height="4" rx="2" fill="#e7b16a"/>
+  <text x="128" y="204" text-anchor="middle" font-family="DejaVu Sans, Liberation Sans, Arial, Helvetica, sans-serif" font-size="24" font-weight="bold" letter-spacing="3" fill="#e9edf2">WORKBENCH</text>
+</svg>
