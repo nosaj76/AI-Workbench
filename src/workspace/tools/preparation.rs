@@ -289,10 +289,21 @@ impl ToolEngine {
                         .transpose()?,
                     ..Default::default()
                 };
+                let mut spec = spec;
+                spec.sandbox = self.command_sandbox()?;
                 spec.validate()?;
                 let details = command_preview(&spec);
                 expected.push(state);
-                ("Run local command".into(),"This command is not sandboxed. It can read, change files, or use the network with your OS permissions. Only the exact executable and arguments shown are approved.".into(),details,Operation::Command{spec})
+                let description = match &spec.sandbox {
+                    Some(policy) => format!("Runs in a sandbox: it can change files only in the project folder, cannot see your home folder{}. Only the exact executable and arguments shown are approved.", if policy.network { ", and may use the network" } else { ", and has no network" }),
+                    None => "This command is not sandboxed. It can read, change files, or use the network with your OS permissions. Only the exact executable and arguments shown are approved.".into(),
+                };
+                (
+                    "Run local command".into(),
+                    description,
+                    details,
+                    Operation::Command { spec },
+                )
             }
             "fetch_url" => {
                 self.require_network()?;

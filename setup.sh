@@ -91,25 +91,25 @@ sudo_cmd=(sudo)
 # ---------------------------------------------------------------- packages
 if command -v apt-get >/dev/null 2>&1; then
     pm=apt
-    build_pkgs=(build-essential pkg-config curl git util-linux libxkbcommon-dev libgl1-mesa-dev libwayland-dev)
+    build_pkgs=(build-essential pkg-config curl git util-linux libxkbcommon-dev libgl1-mesa-dev libwayland-dev bubblewrap)
     optional_pkgs=(poppler-utils tesseract-ocr tesseract-ocr-eng ffmpeg espeak-ng lynx w3m texlive-latex-base xdg-utils)
     pm_update() { run "${sudo_cmd[@]}" apt-get update; }
     pm_install() { run "${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"; }
 elif command -v dnf >/dev/null 2>&1; then
     pm=dnf
-    build_pkgs=(gcc gcc-c++ make pkgconf-pkg-config curl git util-linux libxkbcommon-devel mesa-libGL-devel wayland-devel)
+    build_pkgs=(gcc gcc-c++ make pkgconf-pkg-config curl git util-linux libxkbcommon-devel mesa-libGL-devel wayland-devel bubblewrap)
     optional_pkgs=(poppler-utils tesseract tesseract-langpack-eng ffmpeg-free espeak-ng lynx w3m texlive-scheme-basic xdg-utils)
     pm_update() { :; }
     pm_install() { run "${sudo_cmd[@]}" dnf install -y "$@"; }
 elif command -v pacman >/dev/null 2>&1; then
     pm=pacman
-    build_pkgs=(base-devel pkgconf curl git util-linux libxkbcommon mesa wayland)
+    build_pkgs=(base-devel pkgconf curl git util-linux libxkbcommon mesa wayland bubblewrap)
     optional_pkgs=(poppler tesseract tesseract-data-eng ffmpeg espeak-ng lynx w3m texlive-basic xdg-utils)
     pm_update() { :; }  # pacman -S without -u would risk a partial upgrade
     pm_install() { run "${sudo_cmd[@]}" pacman -S --needed --noconfirm "$@"; }
 elif command -v zypper >/dev/null 2>&1; then
     pm=zypper
-    build_pkgs=(gcc gcc-c++ make pkg-config curl git util-linux libxkbcommon-devel Mesa-libGL-devel wayland-devel)
+    build_pkgs=(gcc gcc-c++ make pkg-config curl git util-linux libxkbcommon-devel Mesa-libGL-devel wayland-devel bubblewrap)
     optional_pkgs=(poppler-tools tesseract-ocr tesseract-ocr-traineddata-english ffmpeg espeak-ng lynx w3m texlive-latex xdg-utils)
     pm_update() { run "${sudo_cmd[@]}" zypper --non-interactive refresh; }
     pm_install() { run "${sudo_cmd[@]}" zypper --non-interactive install --no-recommends "$@"; }

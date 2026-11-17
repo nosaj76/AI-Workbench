@@ -133,17 +133,26 @@ impl ToolEngine {
                 args: arguments,
                 rows: bounded_u64(args, "rows", 28, 2, 300)? as u16,
                 cols: bounded_u64(args, "cols", 100, 2, 500)? as u16,
+                sandbox: self.command_sandbox()?,
                 ..Default::default()
             };
             config.validate()?;
             let (wait_ms, max_bytes) = read_options(args, DEFAULT_WAIT)?;
-            let details = json!({"program":config.program,"args":config.args,"cwd":config.cwd,"title":config.title,"rows":config.rows,"cols":config.cols,"wait_ms":wait_ms,"max_bytes":max_bytes,"persistent":true,"sandboxed":false});
+            let details = json!({"program":config.program,"args":config.args,"cwd":config.cwd,"title":config.title,"rows":config.rows,"cols":config.cols,"wait_ms":wait_ms,"max_bytes":max_bytes,"persistent":true,"sandbox":config.sandbox.as_ref().map(|p| p.summary()).unwrap_or(json!({"sandboxed":false}))});
             expected.push(state);
             return Ok((
                 format!("Open terminal: {}", config.title),
-                "Start this interactive process with your OS permissions. Further AI input uses the command approval setting; reading output does not send commands. The session remains available in Terminals.".into(),
+                if config.sandbox.is_some() {
+                    "Start this interactive process in the sandbox: it can change files only in the project folder and cannot see your home folder. Further AI input uses the command approval setting; reading output does not send commands. The session remains available in Terminals.".into()
+                } else {
+                    "Start this interactive process with your OS permissions. Further AI input uses the command approval setting; reading output does not send commands. The session remains available in Terminals.".into()
+                },
                 details,
-                Operation::TerminalOpen { config, wait_ms, max_bytes },
+                Operation::TerminalOpen {
+                    config,
+                    wait_ms,
+                    max_bytes,
+                },
             ));
         }
         let id = required(args, "session_id")?;
@@ -171,8 +180,8 @@ impl ToolEngine {
                 let (wait_ms, max_bytes) = read_options(args, DEFAULT_WAIT)?;
                 Ok((
                     format!("Type in {}", summary.title),
-                    "Send the exact previewed text to this terminal's current foreground program. It may be Bash, BASIC, or another application; typing can execute commands with your OS permissions.".into(),
-                    json!({"session":summary,"text":text,"enter":enter,"input_bytes":input.len(),"line_endings":"CRLF, LF and CR become Enter; append Enter when enter=true and text has no trailing newline","wait_ms":wait_ms,"max_bytes":max_bytes,"sandboxed":false}),
+                    if summary.sandboxed { "Send the exact previewed text to this sandboxed terminal's foreground program. Commands it runs stay inside the sandbox.".into() } else { "Send the exact previewed text to this terminal's current foreground program. It may be Bash, BASIC, or another application; typing can execute commands with your OS permissions.".into() },
+                    json!({"session":summary,"text":text,"enter":enter,"input_bytes":input.len(),"line_endings":"CRLF, LF and CR become Enter; append Enter when enter=true and text has no trailing newline","wait_ms":wait_ms,"max_bytes":max_bytes,"sandboxed":summary.sandboxed}),
                     Operation::TerminalWrite { session_id:id, text, enter, wait_ms, max_bytes },
                 ))
             }
@@ -574,6 +583,55 @@ mod tests {
             optional_u64(&json!({"after":"42"}), "after").unwrap(),
             Some(42)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandboxed_terminal_writes_the_project_but_cannot_see_home() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let engine = engine(root.path(), backups.path());
+        engine.set_sandbox(super::super::SandboxSettings {
+            mode: crate::sandbox::SandboxMode::Required,
+            ..Default::default()
+        });
+        let action = proposal(
+            &engine,
+            "terminal_open",
+            json!({"program":"/bin/bash","args":["--noprofile","--norc"],"wait_ms":500}),
+        );
+        assert_eq!(action.details["sandbox"]["sandboxed"], true);
+        let id = engine.approve(&action).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(engine.terminal_manager().summary(&id).unwrap().sandboxed);
+        engine
+            .terminal_manager()
+            .input(
+                &id,
+                b"echo ok > made.txt; ls -A \"$HOME\" | wc -l > home.txt; exit\r",
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.path().join("home.txt").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            fs::read_to_string(root.path().join("made.txt")).unwrap(),
+            "ok\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("home.txt"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        let _ = engine.terminal_manager().close(&id);
     }
 
     #[cfg(unix)]

@@ -70,6 +70,13 @@ pub struct Settings {
     /// Run commands, adapters, external agents and MCP calls without asking.
     #[serde(default)]
     pub auto_approve_commands: bool,
+    /// Isolate commands and terminals the model proposes with bubblewrap:
+    /// auto (when available), required (refuse without it) or off.
+    pub command_sandbox: String,
+    /// Let sandboxed commands use the network.
+    pub sandbox_network: bool,
+    /// Folders sandboxed commands may read, one per line (`~/` allowed).
+    pub sandbox_read_only_paths: String,
     pub retrieval_enabled: bool,
     pub allow_remote: bool,
     pub network_tools: bool,
@@ -149,6 +156,9 @@ impl Default for Settings {
             auto_approve_web: false,
             auto_approve_file_changes: false,
             auto_approve_commands: false,
+            command_sandbox: "auto".into(),
+            sandbox_network: false,
+            sandbox_read_only_paths: crate::sandbox::DEFAULT_READ_ONLY_PATHS.into(),
             retrieval_enabled: false,
             allow_remote: false,
             network_tools: false,
@@ -276,6 +286,7 @@ impl Settings {
             crate::integrations::validate_http_url(&self.local_sites_url)
                 .context("Invalid local sites URL")?;
         }
+        crate::sandbox::SandboxMode::parse(&self.command_sandbox)?;
         let browser = self.text_browser.trim().to_ascii_lowercase();
         if !(browser.is_empty()
             || matches!(browser.as_str(), "auto" | "off" | "none")

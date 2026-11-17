@@ -108,11 +108,37 @@ impl Workbench {
                 "Commands and interactive terminals, adapters, external agents and MCP calls",
             );
             ui.small("Includes opening Bash and sending text or keys to programs such as modernbasic. Reading an existing terminal needs no command approval. Chat Stop ends AI interaction; the terminal stays open until you close it.");
-            if draft.auto_approve_commands {
+            ui.horizontal(|ui| {
+                ui.label("Command sandbox");
+                egui::ComboBox::from_id_salt("command_sandbox")
+                    .selected_text(match draft.command_sandbox.as_str() {
+                        "required" => "Required",
+                        "off" => "Off",
+                        _ => "Auto",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut draft.command_sandbox, "auto".to_string(), "Auto");
+                        ui.selectable_value(&mut draft.command_sandbox, "required".to_string(), "Required");
+                        ui.selectable_value(&mut draft.command_sandbox, "off".to_string(), "Off");
+                    });
+            });
+            let sandbox_ready = crate::sandbox::available();
+            ui.small(if sandbox_ready {
+                "Commands and terminals the AI opens run in a bubblewrap sandbox: they can change files only in the project folder, see an empty home folder and get no network unless allowed below."
+            } else {
+                "Bubblewrap is not available, so Auto runs commands unsandboxed and Required refuses them. Install it with: sudo apt install bubblewrap"
+            });
+            ui.checkbox(&mut draft.sandbox_network, "Allow network access inside the sandbox");
+            ui.label("Folders the sandbox may read (one per line, ~/ allowed)");
+            ui.add(egui::TextEdit::multiline(&mut draft.sandbox_read_only_paths).desired_rows(3).desired_width(f32::INFINITY));
+            let sandboxed = draft.command_sandbox != "off" && sandbox_ready;
+            if draft.auto_approve_commands && !sandboxed {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 90, 40),
                     "Commands run with your user permissions and are not sandboxed. The model can run anything your account can.",
                 );
+            } else if draft.auto_approve_commands {
+                ui.small("Approved commands still run inside the sandbox. Adapters, external agents and MCP servers you configured run outside it.");
             }
             ui.small("Every automatic approval is still recorded in the action log. Background jobs and subagents keep asking or denying as before.");
             ui.separator();
