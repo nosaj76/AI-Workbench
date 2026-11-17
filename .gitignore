@@ -1,0 +1,5 @@
+/target/
+/reports/
+*.previous
+*.log
+/.workbench-build.lock

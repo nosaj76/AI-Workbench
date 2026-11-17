@@ -1,0 +1,22 @@
+name: Rust validation
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Packaging tests (no inference)
+        run: python3 scripts/test_package.py
+      - name: Build and test the actual source
+        run: ./verify.sh
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: validation-logs
+          path: reports/local-build/
