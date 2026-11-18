@@ -907,6 +907,13 @@ impl ToolEngine {
         {
             tools.push(definition("mcp_list", "List configured enabled MCP servers and tools of already connected servers. Does not launch anything.", json!({}), &[]));
             tools.push(definition("mcp_connect", "Propose starting an enabled MCP server. Its executable has ordinary OS permissions; requires approval.", json!({"server_id":string()}), &["server_id"]));
+            tools.push(definition(
+                "mcp_read",
+                "Read a resource a connected MCP server advertised (see mcp_list).",
+                json!({"server_id":string(),"uri":string()}),
+                &["server_id", "uri"],
+            ));
+            tools.push(definition("mcp_prompt", "Get a prompt template a connected MCP server advertised, filled with string arguments.", json!({"server_id":string(),"name":string(),"arguments":{"type":"object"}}), &["server_id","name"]));
             tools.push(definition("mcp_call", "Propose a call to an advertised tool on a connected MCP server. Every call requires user approval.", json!({"server_id":string(),"tool_name":string(),"arguments":{"type":"object"}}), &["server_id","tool_name","arguments"]));
         }
         if self.workspace_tools_enabled()
@@ -975,7 +982,7 @@ impl ToolEngine {
                 let mut c = client
                     .lock()
                     .map_err(|_| anyhow::anyhow!("MCP client lock failed"))?;
-                json!({"id":config.id,"name":config.name,"connected":c.is_connected(),"web_search":config.web_search,"tools":c.tools})
+                json!({"id":config.id,"name":config.name,"connected":c.is_connected(),"web_search":config.web_search,"tools":c.tools,"resources":c.resources,"prompts":c.prompts})
             } else {
                 json!({"id":config.id,"name":config.name,"connected":false,"web_search":config.web_search,"tools":[]})
             };

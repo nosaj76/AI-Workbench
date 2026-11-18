@@ -100,6 +100,41 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
+/// A resource a server advertises through `resources/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpResource {
+    pub uri: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// A prompt template a server advertises through `prompts/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpPrompt {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// Text returned from one resource read or prompt, before it reaches a model.
+const MAX_MCP_TEXT: usize = 64 * 1024;
+const MAX_MCP_LISTED: usize = 1024;
+
 fn default_schema() -> Value {
     json!({"type":"object","properties":{}})
 }
@@ -116,6 +151,8 @@ pub struct McpClient {
     pub server_info: Value,
     pub protocol_version: String,
     pub tools: Vec<McpTool>,
+    pub resources: Vec<McpResource>,
+    pub prompts: Vec<McpPrompt>,
     closed: bool,
     cancel: Option<Arc<AtomicBool>>,
 }
@@ -348,6 +385,8 @@ impl McpClient {
             server_info: Value::Null,
             protocol_version: String::new(),
             tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
             closed: false,
             cancel,
         };
@@ -373,6 +412,14 @@ impl McpClient {
         client.notify("notifications/initialized", json!({}))?;
         if initialized.pointer("/capabilities/tools").is_some() {
             client.refresh_tools()?;
+        }
+        // Resources and prompts are optional extras: a server that lists them
+        // badly still connects, with its tools.
+        if initialized.pointer("/capabilities/resources").is_some() {
+            let _ = client.refresh_resources();
+        }
+        if initialized.pointer("/capabilities/prompts").is_some() {
+            let _ = client.refresh_prompts();
         }
         Ok(client)
     }
@@ -436,6 +483,119 @@ impl McpClient {
             }
         }
         bail!("MCP tool list exceeded 32 pages")
+    }
+
+    /// Every page of a `*/list` method, bounded in pages and items.
+    fn list_all(&mut self, method: &str, key: &str) -> Result<Vec<Value>> {
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        for _ in 0..32 {
+            let params = cursor
+                .as_ref()
+                .map(|v| json!({"cursor":v}))
+                .unwrap_or_else(|| json!({}));
+            let result = self.request(method, params)?;
+            let batch = result
+                .get(key)
+                .and_then(Value::as_array)
+                .with_context(|| format!("MCP {method} lacks a {key} array"))?;
+            items.extend(batch.iter().cloned());
+            if items.len() > MAX_MCP_LISTED {
+                bail!("MCP {method} exceeds {MAX_MCP_LISTED} items");
+            }
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            match &cursor {
+                None => return Ok(items),
+                Some(value) if !seen.insert(value.clone()) => {
+                    bail!("MCP pagination cursor repeated")
+                }
+                _ => {}
+            }
+        }
+        bail!("MCP {method} exceeded 32 pages")
+    }
+
+    pub fn refresh_resources(&mut self) -> Result<Vec<McpResource>> {
+        let resources = self
+            .list_all("resources/list", "resources")?
+            .into_iter()
+            .map(|v| serde_json::from_value(v).context("Invalid MCP resource"))
+            .collect::<Result<Vec<McpResource>>>()?;
+        self.resources = resources.clone();
+        Ok(resources)
+    }
+
+    pub fn refresh_prompts(&mut self) -> Result<Vec<McpPrompt>> {
+        let prompts = self
+            .list_all("prompts/list", "prompts")?
+            .into_iter()
+            .map(|v| serde_json::from_value(v).context("Invalid MCP prompt"))
+            .collect::<Result<Vec<McpPrompt>>>()?;
+        self.prompts = prompts.clone();
+        Ok(prompts)
+    }
+
+    /// Read an advertised resource. Text is bounded; binary contents are
+    /// described, not returned.
+    pub fn read_resource(&mut self, uri: &str) -> Result<Value> {
+        if !self.resources.iter().any(|r| r.uri == uri) {
+            bail!("Resource {uri} was not advertised by this MCP server; use mcp_list to see its resources");
+        }
+        let result = self.request("resources/read", json!({ "uri": uri }))?;
+        let contents = result
+            .get("contents")
+            .and_then(Value::as_array)
+            .context("MCP resources/read lacks a contents array")?;
+        let mut budget = MAX_MCP_TEXT;
+        let items: Vec<Value> = contents
+            .iter()
+            .map(|item| {
+                let uri = item.get("uri").cloned().unwrap_or(Value::Null);
+                let mime = item.get("mimeType").cloned().unwrap_or(Value::Null);
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    let kept: String = text.chars().take(budget).collect();
+                    budget = budget.saturating_sub(kept.chars().count());
+                    let truncated = kept.len() < text.len();
+                    json!({"uri":uri,"mimeType":mime,"text":kept,"truncated":truncated})
+                } else {
+                    let bytes = item.get("blob").and_then(Value::as_str).map_or(0, |b| b.len() * 3 / 4);
+                    json!({"uri":uri,"mimeType":mime,"binary_bytes":bytes,"note":"Binary content is not shown to the model"})
+                }
+            })
+            .collect();
+        Ok(json!({ "contents": items }))
+    }
+
+    /// Fill an advertised prompt template with string arguments.
+    pub fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<Value> {
+        let prompt = self
+            .prompts
+            .iter()
+            .find(|p| p.name == name)
+            .with_context(|| format!("Prompt {name} was not advertised by this MCP server"))?;
+        for argument in prompt.arguments.iter().filter(|a| a.required) {
+            if !arguments.contains_key(&argument.name) {
+                bail!("Prompt {name} requires the argument {}", argument.name);
+            }
+        }
+        if arguments.values().any(|v| !v.is_string()) {
+            bail!("MCP prompt arguments must be strings");
+        }
+        let mut result = self.request("prompts/get", json!({"name":name,"arguments":arguments}))?;
+        let text = serde_json::to_string(&result)?;
+        if text.len() > MAX_MCP_TEXT {
+            result = json!({"truncated": true, "text": text.chars().take(MAX_MCP_TEXT).collect::<String>()});
+        }
+        Ok(result)
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
@@ -748,6 +908,71 @@ for line in sys.stdin:
         assert!(client.call_tool("not-listed", json!({})).is_err());
         client.shutdown();
         assert!(!client.is_connected());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resources_and_prompts_are_listed_read_and_bounded() {
+        let script = r#"import sys,json
+for line in sys.stdin:
+ r=json.loads(line)
+ if 'id' not in r: continue
+ m=r['method']; p=r.get('params',{})
+ if m=='initialize': result={'protocolVersion':p['protocolVersion'],'capabilities':{'resources':{},'prompts':{}},'serverInfo':{'name':'t','version':'1'}}
+ elif m=='resources/list' and 'cursor' not in p: result={'resources':[{'uri':'file:///a.txt','name':'a','mimeType':'text/plain'}],'nextCursor':'2'}
+ elif m=='resources/list': result={'resources':[{'uri':'mem://big','name':'big'},{'uri':'mem://img','name':'img'}]}
+ elif m=='resources/read' and p['uri']=='mem://big': result={'contents':[{'uri':p['uri'],'text':'x'*200000}]}
+ elif m=='resources/read' and p['uri']=='mem://img': result={'contents':[{'uri':p['uri'],'mimeType':'image/png','blob':'AAAA'}]}
+ elif m=='resources/read': result={'contents':[{'uri':p['uri'],'mimeType':'text/plain','text':'hello'}]}
+ elif m=='prompts/list': result={'prompts':[{'name':'review','arguments':[{'name':'file','required':True}]}]}
+ elif m=='prompts/get': result={'messages':[{'role':'user','content':{'type':'text','text':'Review '+p['arguments']['file']}}]}
+ else: result={}
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':result}),flush=True)
+"#;
+        let config = McpServerConfig {
+            id: "fixture".into(),
+            name: "Fixture".into(),
+            program: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            cwd: None,
+            env: BTreeMap::new(),
+            enabled: true,
+            timeout_secs: 3,
+            web_search: None,
+        };
+        let mut client = McpClient::connect(&config, Path::new("/tmp")).unwrap();
+        assert!(client.tools.is_empty());
+        let uris: Vec<_> = client.resources.iter().map(|r| r.uri.as_str()).collect();
+        assert_eq!(uris, ["file:///a.txt", "mem://big", "mem://img"]);
+        assert_eq!(
+            client.read_resource("file:///a.txt").unwrap()["contents"][0]["text"],
+            "hello"
+        );
+        let big = client.read_resource("mem://big").unwrap();
+        assert_eq!(big["contents"][0]["truncated"], true);
+        assert_eq!(
+            big["contents"][0]["text"].as_str().unwrap().len(),
+            MAX_MCP_TEXT
+        );
+        let image = client.read_resource("mem://img").unwrap();
+        assert!(
+            image["contents"][0].get("blob").is_none() && image["contents"][0]["binary_bytes"] == 3
+        );
+        assert!(
+            client.read_resource("file:///etc/passwd").is_err(),
+            "unadvertised URI"
+        );
+
+        let mut args = serde_json::Map::new();
+        assert!(
+            client.get_prompt("review", &args).is_err(),
+            "missing required argument"
+        );
+        args.insert("file".into(), json!("main.rs"));
+        let prompt = client.get_prompt("review", &args).unwrap();
+        assert_eq!(prompt["messages"][0]["content"]["text"], "Review main.rs");
+        assert!(client.get_prompt("other", &args).is_err());
+        client.shutdown();
     }
 
     #[test]
