@@ -339,8 +339,27 @@ fn similarity(a: &str, b: &str) -> f64 {
             return 0.0;
         }
     }
-    let shared = |word: &&str| left.contains(*word) && right.contains(*word);
-    if a.split_whitespace().filter(shared).ne(b.split_whitespace().filter(shared)) {
+    // Each direction word must point at the same operand ("to fahrenheit" is
+    // not "to celsius"); the rest of the word order is free.
+    let direction = |text: &str| -> BTreeSet<(String, String)> {
+        let words: Vec<&str> = text
+            .split_whitespace()
+            .filter(|w| left.contains(*w) && right.contains(*w))
+            .collect();
+        let mut pairs = BTreeSet::new();
+        for (i, word) in words.iter().enumerate() {
+            if matches!(*word, "to" | "from" | "into") {
+                let next = words[i + 1..]
+                    .iter()
+                    .find(|w| !matches!(**w, "to" | "from" | "into"))
+                    .copied()
+                    .unwrap_or("");
+                pairs.insert((word.to_string(), next.to_string()));
+            }
+        }
+        pairs
+    };
+    if direction(a) != direction(b) {
         return 0.0;
     }
     let (a, b) = (left, right);
@@ -1172,6 +1191,24 @@ mod tests {
         let second = cache.store(save(reverse, "divide by 1.8"), 30).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(cache.lookup(reverse).unwrap().unwrap().id, second.id);
+    }
+
+    #[test]
+    fn word_order_matters_only_for_conversion_direction() {
+        let key = question_key;
+        assert_eq!(similarity(&key("git rename branch"), &key("rename git branch")), 1.0);
+        assert_eq!(
+            similarity(&key("convert from word to pdf"), &key("convert to pdf from word")),
+            1.0
+        );
+        assert_eq!(
+            similarity(&key("Convert Celsius to Fahrenheit"), &key("Convert Fahrenheit to Celsius")),
+            0.0
+        );
+        assert_eq!(
+            similarity(&key("convert word into pdf"), &key("convert pdf into word")),
+            0.0
+        );
     }
 
     #[test]

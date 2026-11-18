@@ -461,8 +461,14 @@ impl Workbench {
                     self.tool_result = text;
                 }
                 WorkEvent::Status(s) => self.status = s,
-                WorkEvent::Import(session) => {
+                WorkEvent::Import(mut session) => {
                     self.persist();
+                    // Importing a conversation that is still stored must not collide
+                    // with the original; keep both.
+                    if self.store.load(&session.id).is_ok() {
+                        session.id = uuid::Uuid::new_v4().to_string();
+                        self.status = "This conversation already exists; the import was saved as a copy.".into();
+                    }
                     self.input.clear();
                     self.queued_prompts.clear();
                     self.attachments.clear();

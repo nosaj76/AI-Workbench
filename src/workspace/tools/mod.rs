@@ -1754,6 +1754,19 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_files_are_reported_without_blocking_a_complete_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        fs::write(dir.path().join("notes.txt"), "plain text\n").unwrap();
+        fs::write(dir.path().join("latin1.txt"), b"caf\xe9\n").unwrap();
+        let result = immediate(&e, "search_files", json!({"query":"absent"}));
+        assert_eq!(result["complete"], true, "{result}");
+        assert_eq!(result["files_skipped"], 1);
+        assert!(result["coverage"].as_str().unwrap().contains("could not be read"));
+    }
+
+    #[test]
     fn unknown_resume_cursor_is_an_error_not_an_empty_complete_result() {
         let dir = tempfile::tempdir().unwrap();
         let backups = tempfile::tempdir().unwrap();
