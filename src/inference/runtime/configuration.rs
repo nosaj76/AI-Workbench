@@ -10,6 +10,7 @@ pub fn configured_engine(
         network: settings.sandbox_network,
         read_only: crate::sandbox::parse_paths(&settings.sandbox_read_only_paths),
     });
+    engine.set_check_mode(crate::tools::CheckMode::parse(&settings.check_after_edits)?);
     engine.set_network_enabled(settings.network_tools);
     engine.set_knowledge_search(settings.knowledge_search);
     if settings.network_tools && !settings.searxng_url.trim().is_empty() {

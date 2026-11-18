@@ -81,6 +81,9 @@ pub struct Settings {
     pub sandbox_network: bool,
     /// Folders sandboxed commands may read, one per line (`~/` allowed).
     pub sandbox_read_only_paths: String,
+    /// After approved file changes, run a check in the sandbox and show the
+    /// model its diagnostics: `auto`, `off`, or a JSON argv.
+    pub check_after_edits: String,
     pub retrieval_enabled: bool,
     pub allow_remote: bool,
     pub network_tools: bool,
@@ -164,6 +167,7 @@ impl Default for Settings {
             command_sandbox: "auto".into(),
             sandbox_network: false,
             sandbox_read_only_paths: crate::sandbox::DEFAULT_READ_ONLY_PATHS.into(),
+            check_after_edits: "auto".into(),
             retrieval_enabled: false,
             allow_remote: false,
             network_tools: false,
@@ -292,6 +296,7 @@ impl Settings {
                 .context("Invalid local sites URL")?;
         }
         crate::sandbox::SandboxMode::parse(&self.command_sandbox)?;
+        crate::tools::CheckMode::parse(&self.check_after_edits)?;
         let browser = self.text_browser.trim().to_ascii_lowercase();
         if !(browser.is_empty()
             || matches!(browser.as_str(), "auto" | "off" | "none")

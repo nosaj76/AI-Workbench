@@ -2,7 +2,9 @@
 //! Model-generated arguments are data, never authority to approve an operation.
 
 mod checkpoints;
+mod checks;
 pub use checkpoints::{Checkpoint, CheckpointList, CheckpointState};
+pub use checks::CheckMode;
 mod execution;
 mod filesystem;
 mod git;
@@ -310,6 +312,8 @@ pub struct ToolEngine {
     adapters: Arc<Mutex<BTreeMap<String, CommandAdapter>>>,
     external_agents: Arc<Mutex<BTreeMap<String, crate::external_agents::AgentProfile>>>,
     external_runs: PathBuf,
+    /// What to run after approved file changes (in the sandbox only).
+    check_mode: Arc<Mutex<CheckMode>>,
 }
 
 impl ToolEngine {
@@ -334,6 +338,7 @@ impl ToolEngine {
             terminals: crate::terminal::TerminalManager::default(),
             unread_terminal_output: Arc::new(Mutex::new(HashMap::new())),
             external_runs: backup_root.join("external-agent-runs"),
+            check_mode: Arc::new(Mutex::new(CheckMode::Off)),
             backup_root,
             pending: Arc::new(Mutex::new(HashMap::new())),
             network_enabled: Arc::new(AtomicBool::new(false)),

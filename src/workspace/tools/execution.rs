@@ -57,6 +57,16 @@ impl ToolEngine {
         if cancel.load(Ordering::Relaxed) {
             bail!("Action cancelled before execution");
         }
+        let result = self.dispatch_approved(action, cancel, sink);
+        self.with_post_change_check(&action.operation, result)
+    }
+
+    fn dispatch_approved(
+        &self,
+        action: &PendingAction,
+        cancel: Arc<AtomicBool>,
+        sink: Option<integrations::OutputSink>,
+    ) -> Result<Value> {
         match &action.operation {
             Operation::TerminalOpen { .. }
             | Operation::TerminalWrite { .. }
