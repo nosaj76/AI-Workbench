@@ -67,9 +67,13 @@ pub struct Settings {
     /// project without asking (backups are kept and changes are checked on disk).
     #[serde(default)]
     pub auto_approve_file_changes: bool,
-    /// Run commands, adapters, external agents and MCP calls without asking.
+    /// Run commands and terminal input that stay inside the sandbox without asking.
     #[serde(default)]
     pub auto_approve_commands: bool,
+    /// Run unsandboxed commands and terminals, adapters, external agents and
+    /// MCP calls without asking. These have the user's own permissions.
+    #[serde(default)]
+    pub auto_approve_unsandboxed: bool,
     /// Isolate commands and terminals the model proposes with bubblewrap:
     /// auto (when available), required (refuse without it) or off.
     pub command_sandbox: String,
@@ -156,6 +160,7 @@ impl Default for Settings {
             auto_approve_web: false,
             auto_approve_file_changes: false,
             auto_approve_commands: false,
+            auto_approve_unsandboxed: false,
             command_sandbox: "auto".into(),
             sandbox_network: false,
             sandbox_read_only_paths: crate::sandbox::DEFAULT_READ_ONLY_PATHS.into(),

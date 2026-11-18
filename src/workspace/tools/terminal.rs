@@ -94,6 +94,7 @@ impl ToolEngine {
     }
     pub(super) fn read_terminal(&self, args: &Value, cancel: Option<&AtomicBool>) -> Result<Value> {
         let id = required(args, "session_id")?;
+        self.terminals.ai_summary(&id)?;
         let after = optional_u64(args, "after")?;
         let (wait_ms, max_bytes) = read_options(args, 0)?;
         let read = self
@@ -134,6 +135,7 @@ impl ToolEngine {
                 rows: bounded_u64(args, "rows", 28, 2, 300)? as u16,
                 cols: bounded_u64(args, "cols", 100, 2, 500)? as u16,
                 sandbox: self.command_sandbox()?,
+                ai_access: true,
                 ..Default::default()
             };
             config.validate()?;
@@ -165,7 +167,7 @@ impl ToolEngine {
         {
             self.require_terminal_output_drained(&id)?;
         }
-        let summary = self.terminals.summary(&id)?;
+        let summary = self.terminals.ai_summary(&id)?;
         if name != "terminal_close" && !summary.alive {
             bail!("This terminal shell has exited; read its output or open a new terminal");
         }
@@ -182,7 +184,7 @@ impl ToolEngine {
                     format!("Type in {}", summary.title),
                     if summary.sandboxed { "Send the exact previewed text to this sandboxed terminal's foreground program. Commands it runs stay inside the sandbox.".into() } else { "Send the exact previewed text to this terminal's current foreground program. It may be Bash, BASIC, or another application; typing can execute commands with your OS permissions.".into() },
                     json!({"session":summary,"text":text,"enter":enter,"input_bytes":input.len(),"line_endings":"CRLF, LF and CR become Enter; append Enter when enter=true and text has no trailing newline","wait_ms":wait_ms,"max_bytes":max_bytes,"sandboxed":summary.sandboxed}),
-                    Operation::TerminalWrite { session_id:id, text, enter, wait_ms, max_bytes },
+                    Operation::TerminalWrite { session_id:id, text, enter, wait_ms, max_bytes, sandboxed: summary.sandboxed },
                 ))
             }
             "terminal_key" => {
@@ -193,7 +195,7 @@ impl ToolEngine {
                     format!("Send {key} to {}", summary.title),
                     "Send this key to the existing foreground program. Ctrl+C interrupts it; Ctrl+D can end input or exit a shell.".into(),
                     json!({"session":summary,"key":key,"wait_ms":wait_ms,"max_bytes":max_bytes}),
-                    Operation::TerminalKey { session_id:id, key, wait_ms, max_bytes },
+                    Operation::TerminalKey { session_id:id, key, wait_ms, max_bytes, sandboxed: summary.sandboxed },
                 ))
             }
             "terminal_resize" => {
@@ -227,6 +229,21 @@ impl ToolEngine {
         cancel: Arc<AtomicBool>,
         sink: Option<integrations::OutputSink>,
     ) -> Result<Value> {
+        if let Operation::TerminalWrite { session_id, .. }
+        | Operation::TerminalKey { session_id, .. }
+        | Operation::TerminalResize { session_id, .. }
+        | Operation::TerminalClose { session_id } = operation
+        {
+            let summary = self.terminals.ai_summary(session_id)?;
+            // The approval kind was chosen from this flag; it must still hold.
+            if let Operation::TerminalWrite { sandboxed, .. }
+            | Operation::TerminalKey { sandboxed, .. } = operation
+            {
+                if *sandboxed != summary.sandboxed {
+                    bail!("Terminal sandboxing differs from the preview; request a new preview");
+                }
+            }
+        }
         let (id, after, wait_ms, max_bytes, input_sent) = match operation {
             Operation::TerminalOpen {
                 config,
@@ -242,6 +259,7 @@ impl ToolEngine {
                 enter,
                 wait_ms,
                 max_bytes,
+                ..
             } => {
                 self.require_terminal_output_drained(session_id)?;
                 let input = typed_input(text, *enter)?;
@@ -256,6 +274,7 @@ impl ToolEngine {
                 key,
                 wait_ms,
                 max_bytes,
+                ..
             } => {
                 if !matches!(key.as_str(), "interrupt" | "eof") {
                     self.require_terminal_output_drained(session_id)?;
@@ -491,6 +510,63 @@ mod tests {
     }
 
     #[test]
+    fn user_terminals_are_private_to_the_ai_unless_shared() {
+        let root = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let engine = engine(root.path(), backups.path());
+        let manager = engine.terminal_manager();
+        let own = open_bash(&engine);
+        // Opened from the Terminals panel: no AI access by default.
+        let user = manager
+            .open(TerminalConfig {
+                program: "bash".into(),
+                cwd: root.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap();
+        for (name, args) in [
+            ("terminal_read", json!({"session_id":user})),
+            (
+                "terminal_write",
+                json!({"session_id":user,"text":"echo hi"}),
+            ),
+            ("terminal_key", json!({"session_id":user,"key":"interrupt"})),
+            (
+                "terminal_resize",
+                json!({"session_id":user,"rows":20,"cols":80}),
+            ),
+            ("terminal_close", json!({"session_id":user})),
+        ] {
+            let error = engine.prepare(name, &args).unwrap_err().to_string();
+            assert!(
+                error.contains("not available to the AI") || error.contains("No terminal session"),
+                "{name}: {error}"
+            );
+        }
+        // Only the AI's own terminal is listed.
+        let listed = observe(&engine, "terminal_list", json!({}));
+        let ids: Vec<_> = listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec![own.clone()]);
+        // Sharing grants access; making it private again blocks an already
+        // previewed action at execution time.
+        manager.set_ai_access(&user, true).unwrap();
+        let action = proposal(
+            &engine,
+            "terminal_write",
+            json!({"session_id":user,"text":"echo hi"}),
+        );
+        manager.set_ai_access(&user, false).unwrap();
+        assert!(engine.approve(&action).is_err());
+        manager.close(&user).unwrap();
+        manager.close(&own).unwrap();
+    }
+
+    #[test]
     fn unread_output_blocks_typing_but_can_be_drained_or_interrupted() {
         let root = tempfile::tempdir().unwrap();
         let backups = tempfile::tempdir().unwrap();
@@ -541,7 +617,10 @@ mod tests {
         let action = proposal(&engine, "terminal_open", json!({}));
         assert_eq!(action.details["program"], "bash");
         assert_eq!(action.details["args"], json!(["-i"]));
-        assert_eq!(action.operation.approval_kind(), ApprovalKind::Command);
+        assert_eq!(
+            action.operation.approval_kind(),
+            ApprovalKind::UnsandboxedCommand
+        );
         assert!(
             engine.terminal_manager().list().is_empty(),
             "Preparation must not launch Bash"
@@ -667,7 +746,10 @@ mod tests {
                 "session_id":id,"text":text,"wait_ms":1000,"max_bytes":1024
             }),
         );
-        assert_eq!(action.operation.approval_kind(), ApprovalKind::Command);
+        assert_eq!(
+            action.operation.approval_kind(),
+            ApprovalKind::UnsandboxedCommand
+        );
         assert_eq!(action.details["text"], text);
         let mut result = engine.approve(&action).unwrap();
         let mut output = result["output"].as_str().unwrap().to_owned();

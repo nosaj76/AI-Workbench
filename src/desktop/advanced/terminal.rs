@@ -83,6 +83,23 @@ impl AdvancedUi {
                     ctx.copy_text(screen.text);
                 }
             }
+            if let Ok(summary) = self.terminals.summary(&self.terminal_id) {
+                let mut shared = summary.ai_access;
+                let label = if summary.sandboxed {
+                    "AI may use (sandboxed)"
+                } else {
+                    "AI may use (not sandboxed)"
+                };
+                if ui
+                    .checkbox(&mut shared, label)
+                    .on_hover_text("Lets the assistant read this terminal and, with command approval, type into it. Terminals you open are private by default; with automatic command approval the assistant could run anything your account can in an unsandboxed one.")
+                    .changed()
+                {
+                    if let Err(e) = self.terminals.set_ai_access(&self.terminal_id, shared) {
+                        self.error = Some(e.to_string());
+                    }
+                }
+            }
             ui.label("Scrollback");
             if ui
                 .add(egui::DragValue::new(&mut self.terminal_scrollback).range(0..=10_000))

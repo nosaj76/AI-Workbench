@@ -235,6 +235,9 @@ impl Workbench {
                             self.settings.auto_approve_file_changes
                         }
                         crate::tools::ApprovalKind::Command => self.settings.auto_approve_commands,
+                        crate::tools::ApprovalKind::UnsandboxedCommand => {
+                            self.settings.auto_approve_unsandboxed
+                        }
                     };
                     if automatic {
                         let _ = self.store.audit(

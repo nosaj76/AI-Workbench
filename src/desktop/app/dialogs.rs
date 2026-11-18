@@ -220,11 +220,23 @@ impl Workbench {
                     ui.heading(&approval.action.title);
                     ui.label(&approval.action.description);
                     egui::ScrollArea::both().max_height(440.0).show(ui, |ui| {
+                        // Code (run_python) reads as source, not as an escaped JSON string.
+                        let mut details = approval.action.details.clone();
+                        if let Some(code) = details
+                            .as_object_mut()
+                            .and_then(|map| map.remove("code"))
+                            .and_then(|code| code.as_str().map(str::to_owned))
+                        {
+                            ui.add(
+                                egui::Label::new(RichText::new(code).monospace().size(13.0))
+                                    .selectable(true),
+                            );
+                            ui.separator();
+                        }
                         ui.add(
                             egui::Label::new(
                                 RichText::new(
-                                    serde_json::to_string_pretty(&approval.action.details)
-                                        .unwrap_or_default(),
+                                    serde_json::to_string_pretty(&details).unwrap_or_default(),
                                 )
                                 .monospace()
                                 .size(13.0),

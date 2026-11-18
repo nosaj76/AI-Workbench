@@ -48,6 +48,7 @@ impl ToolEngine {
                     | "make_directory"
                     | "mkdir"
                     | "run_command"
+                    | "run_python"
                     | "terminal_open"
                     | "terminal_list"
                     | "terminal_read"
@@ -69,7 +70,7 @@ impl ToolEngine {
         match name {
             "terminal_list" => {
                 return Ok(PreparedTool::Immediate(json!({
-                    "sessions": self.terminals.list(),
+                    "sessions": self.terminals.ai_list(),
                     "scope": "selected_workspace",
                     "note": "Use a returned session id to read or interact with that existing terminal."
                 })));
@@ -300,6 +301,47 @@ impl ToolEngine {
                 };
                 (
                     "Run local command".into(),
+                    description,
+                    details,
+                    Operation::Command { spec },
+                )
+            }
+            "run_python" => {
+                let code = required(args, "code")?;
+                if code.len() > 200_000 {
+                    bail!("Python code exceeds 200,000 bytes");
+                }
+                let sandbox = self.command_sandbox()?;
+                if sandbox.is_none() && !self.sandbox_is_off()? {
+                    bail!("run_python needs the command sandbox, and bubblewrap is not available here. Install bubblewrap, or use run_command if you accept running unsandboxed. Nothing was run.");
+                }
+                let state = self.state(".")?;
+                let spec = CommandSpec {
+                    program: "python3".into(),
+                    // Isolated mode: ignore PYTHON* variables and the user site directory.
+                    args: vec!["-I".into(), "-B".into(), "-".into()],
+                    cwd: Some(state.resolved.clone()),
+                    timeout_secs: uint(args, "timeout_secs", 60, 1, 600) as u64,
+                    max_output_bytes: 256 * 1024,
+                    stdin_text: Some(code.clone()),
+                    sandbox,
+                    ..Default::default()
+                };
+                spec.validate()?;
+                let mut details = command_preview(&spec);
+                // The code is the stdin; show it once, readably, under "code".
+                if let Some(map) = details.as_object_mut() {
+                    map.remove("stdin_text");
+                }
+                details["code"] = json!(code);
+                details["language"] = json!("python");
+                expected.push(state);
+                let description = match &spec.sandbox {
+                    Some(policy) => format!("Run this Python code in the sandbox: it can change files only in the project folder{}.", if policy.network { " and may use the network" } else { " and has no network" }),
+                    None => "The command sandbox is off: this Python code runs with your OS permissions.".into(),
+                };
+                (
+                    "Run Python code".into(),
                     description,
                     details,
                     Operation::Command { spec },

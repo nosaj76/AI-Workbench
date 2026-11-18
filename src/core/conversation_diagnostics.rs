@@ -520,7 +520,7 @@ pub fn detect(session: &Session, latest_only: bool) -> Vec<Incident> {
                 check_observed = true;
             }
 
-            if name == "run_command"
+            if matches!(name.as_str(), "run_command" | "run_python")
                 && v.pointer("/result/exit_code").and_then(Value::as_i64) == Some(0)
             {
                 successful_commands += 1;
@@ -617,6 +617,7 @@ fn configuration(dir: &Path) -> Value {
         "num_predict",
         "max_tool_rounds",
         "auto_approve_commands",
+        "auto_approve_unsandboxed",
         "auto_approve_file_changes",
     ] {
         if let Some(value) = parsed.get(key) {
