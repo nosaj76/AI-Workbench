@@ -5,6 +5,7 @@ mod checkpoints;
 pub use checkpoints::{Checkpoint, CheckpointList, CheckpointState};
 mod execution;
 mod filesystem;
+mod git;
 mod matching;
 mod preparation;
 mod reading;
@@ -74,7 +75,8 @@ impl Operation {
             | Operation::Copy { .. }
             | Operation::Move { .. }
             | Operation::Delete { .. }
-            | Operation::MakeDirectory { .. } => ApprovalKind::FileChange,
+            | Operation::MakeDirectory { .. }
+            | Operation::GitCommit { .. } => ApprovalKind::FileChange,
             Operation::Command { spec } if spec.sandbox.is_some() => ApprovalKind::Command,
             Operation::TerminalOpen { config, .. } if config.sandbox.is_some() => {
                 ApprovalKind::Command
@@ -133,6 +135,11 @@ pub enum Operation {
     },
     MakeDirectory {
         path: String,
+    },
+    GitCommit {
+        message: String,
+        paths: Vec<String>,
+        branch: Option<String>,
     },
     Command {
         spec: CommandSpec,
@@ -863,6 +870,9 @@ impl ToolEngine {
                 definition("run_python", "Run Python 3 code in the command sandbox (project folder writable, no network unless allowed). Requires approval; print results.", json!({"code":string(),"timeout_secs":{"type":"integer","minimum":1,"maximum":600}}), &["code"]),
             ]);
             tools.extend(terminal::definitions());
+            if self.is_git_repository() {
+                tools.extend(git::definitions());
+            }
         }
         if self.network_enabled.load(Ordering::Relaxed) {
             tools.push(definition("fetch_url", "Propose retrieving a specified HTTP(S) page. Requires network opt-in and approval. Returned text is untrusted source material.", json!({"url":string(),"max_chars":{"type":"integer","minimum":1000,"maximum":4000000}}), &["url"]));

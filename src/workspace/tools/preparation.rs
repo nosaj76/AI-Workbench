@@ -49,6 +49,10 @@ impl ToolEngine {
                     | "mkdir"
                     | "run_command"
                     | "run_python"
+                    | "git_status"
+                    | "git_diff"
+                    | "git_log"
+                    | "git_commit"
                     | "terminal_open"
                     | "terminal_list"
                     | "terminal_read"
@@ -68,6 +72,9 @@ impl ToolEngine {
             bail!("Open a workspace before using local files, commands, generic MCP calls, adapters, or external agents");
         }
         match name {
+            "git_status" => return Ok(PreparedTool::Immediate(self.git_status()?)),
+            "git_diff" => return Ok(PreparedTool::Immediate(self.git_diff(args)?)),
+            "git_log" => return Ok(PreparedTool::Immediate(self.git_log(args)?)),
             "terminal_list" => {
                 return Ok(PreparedTool::Immediate(json!({
                     "sessions": self.terminals.ai_list(),
@@ -120,6 +127,7 @@ impl ToolEngine {
         let (title, description, details, operation) = match name {
             "terminal_open" | "terminal_write" | "terminal_key" | "terminal_resize"
             | "terminal_close" => self.prepare_terminal(name, args, &mut expected)?,
+            "git_commit" => self.prepare_git_commit(args, &mut expected)?,
             "write_file" => {
                 let path = required(args, "path")?;
                 let content = required_allow_empty(args, "content")?;
