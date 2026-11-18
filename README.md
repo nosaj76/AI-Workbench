@@ -90,7 +90,7 @@ invalid values are rejected without changing anything.
 | **Profiles and prompt library** | Named model/instruction profiles and reusable prompts. |
 | **Speech and transcription** | Programs used to read replies aloud and transcribe audio (e.g. `espeak-ng`, `piper`, `whisper-cli`). |
 | **External agents** | Optional consultation of installed Hermes, Codex, Claude or Gemini CLIs. All start disabled. |
-| **MCP servers and web search** | Brave Search (needs an API key and Node's `npx`) or any MCP server. |
+| **MCP servers and web search** | Brave Search (needs an API key and Node's `npx`) or any MCP server. Starting a server and each tool call need approval; once a server is running, the assistant can read the resources and prompt templates it advertises. |
 
 Settings are stored in `settings.json` in the data directory.
 

@@ -62,6 +62,8 @@ impl ToolEngine {
                     | "terminal_close"
                     | "mcp_list"
                     | "mcp_connect"
+                    | "mcp_read"
+                    | "mcp_prompt"
                     | "mcp_call"
                     | "list_external_agents"
                     | "consult_agent"
@@ -101,6 +103,32 @@ impl ToolEngine {
                 return Ok(PreparedTool::Immediate(self.search(args)?))
             }
             "mcp_list" => return Ok(PreparedTool::Immediate(self.mcp_catalog()?)),
+            // Resources and prompts are read-only data from a server the user
+            // already approved starting; only advertised items can be fetched.
+            "mcp_read" | "mcp_prompt" => {
+                let server_id = required(args, "server_id")?;
+                if !self.mcp_config(&server_id)?.enabled {
+                    bail!("MCP server is disabled");
+                }
+                let client = self.mcp_client(&server_id)?;
+                let mut client = client
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("MCP client lock failed"))?;
+                let result = if name == "mcp_read" {
+                    client.read_resource(&required(args, "uri")?)?
+                } else {
+                    let empty = serde_json::Map::new();
+                    let arguments = match args.get("arguments") {
+                        None | Some(Value::Null) => &empty,
+                        Some(Value::Object(map)) => map,
+                        Some(_) => bail!("MCP prompt arguments must be an object"),
+                    };
+                    client.get_prompt(&required(args, "name")?, arguments)?
+                };
+                return Ok(PreparedTool::Immediate(
+                    json!({"server_id":server_id,"result":result}),
+                ));
+            }
             "list_external_agents" => {
                 let profiles = self
                     .external_agents
