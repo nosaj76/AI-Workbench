@@ -384,23 +384,45 @@ impl Workbench {
         } else {
             58.0
         };
+        let input_id = ui.make_persistent_id("chat_composer_input");
+        // With "Enter sends", take a plain Enter before the text field turns it
+        // into a new line. Shift+Enter (and any other modifier) still types one.
+        let plain_enter = self.settings.enter_sends
+            && ctx.memory(|memory| memory.has_focus(input_id))
+            && ctx.input_mut(|input| {
+                // Match the key event's own modifiers: consume_key would also
+                // take Shift+Enter, because it ignores an extra Shift.
+                let mut taken = false;
+                input.events.retain(|event| {
+                    let plain = matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if modifiers.is_none());
+                    if plain && !taken {
+                        taken = true;
+                        return false;
+                    }
+                    true
+                });
+                taken
+            });
+        let hint = match (self.busy, self.settings.enter_sends) {
+            (true, true) => "Type your next message; Enter queues it until this reply is done...",
+            (true, false) => "Type your next message; Ctrl+Enter queues it until this reply is done...",
+            (false, _) => "Type a message...",
+        };
         let response = ui.add_sized(
             egui::vec2(ui.available_width(), height),
             egui::TextEdit::multiline(&mut self.input)
+                .id(input_id)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
-                .hint_text(if self.busy {
-                    "Type your next message; Ctrl+Enter queues it until this reply is done..."
-                } else {
-                    "Type a message..."
-                }),
+                .hint_text(hint),
         );
         let ctrl_enter = response.has_focus()
             && ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter));
+        let submit = ctrl_enter || plain_enter;
         if self.busy {
-            queue |= ctrl_enter;
+            queue |= submit;
         } else {
-            send |= ctrl_enter;
+            send |= submit;
         }
         if !self.attachments.is_empty() {
             let mut remove = None;
@@ -463,11 +485,23 @@ impl Workbench {
                     self.regenerate();
                     ui.close_menu();
                 }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.settings.enter_sends, "Enter sends message")
+                    .on_hover_text("On: Enter sends and Shift+Enter adds a line. Off: Ctrl+Enter sends.")
+                    .changed()
+                {
+                    self.save_preferences();
+                }
             });
             ui.label(
-                RichText::new("Ctrl+Enter to send")
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
+                RichText::new(if self.settings.enter_sends {
+                    "Enter to send · Shift+Enter for a new line"
+                } else {
+                    "Ctrl+Enter to send"
+                })
+                .small()
+                .color(ui.visuals().weak_text_color()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.busy {
@@ -504,6 +538,7 @@ impl Workbench {
         let mut speak = None;
         let mut inspect = None;
         let mut code_to_export = None;
+        let mut feedback: Option<(String, &'static str)> = None;
         let mut show_more = false;
         egui::ScrollArea::vertical().id_salt("transcript")
             .stick_to_bottom(true)
@@ -607,6 +642,16 @@ impl Workbench {
                                             branch = Some(index);
                                         }
                                         if !user && ui.small_button("Details").clicked() { inspect = Some(entry.id.clone()); }
+                                        if !user && self.streaming != Some(index) {
+                                            let current = entry_feedback(entry);
+                                            for (value, glyph, hint) in [("down", "👎", "Not helpful"), ("up", "👍", "Helpful")] {
+                                                if ui.selectable_label(current == Some(value), glyph)
+                                                    .on_hover_text(if current == Some(value) { "Click again to clear" } else { hint })
+                                                    .clicked() {
+                                                    feedback = Some((entry.id.clone(), value));
+                                                }
+                                            }
+                                        }
                                         if !user && !self.busy
                                             && entry.stats.get("unexecuted_tool_text").and_then(Value::as_bool) != Some(true)
                                             && ui.small_button("Speak").clicked() { speak = Some(entry.message.content.clone()); }
@@ -654,7 +699,8 @@ impl Workbench {
                                 } else if content.is_empty() && self.streaming == Some(index) {
                                     ui.horizontal(|ui| { ui.spinner(); ui.label("Generating…"); });
                                 } else {
-                                    CommonMarkViewer::new().show(ui, &mut self.markdown, content);
+                                    let content = math::render_math(content);
+                                    CommonMarkViewer::new().show(ui, &mut self.markdown, &content);
                                 }
                                 if !entry.message.tool_calls.is_empty() {
                                     ui.label(RichText::new(format!("{} tool request(s)", entry.message.tool_calls.len())).small());
@@ -690,6 +736,9 @@ impl Workbench {
         if let Some(id) = code_to_export {
             self.prepare_code_export(&id);
         }
+        if let Some((id, value)) = feedback {
+            self.set_feedback(&id, value);
+        }
         if let Some(index) = branch {
             self.code_export_preview = None;
             self.persist();
@@ -704,6 +753,28 @@ impl Workbench {
         if let Some(text) = speak {
             self.speak(text);
         }
+    }
+
+    /// Mark an answer helpful ("up") or not ("down"); choosing the same rating again clears it.
+    pub(super) fn set_feedback(&mut self, entry_id: &str, value: &str) {
+        let Some(entry) = self
+            .session
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == entry_id && entry.message.role == "assistant")
+        else {
+            return;
+        };
+        if !entry.stats.is_object() {
+            entry.stats = json!({});
+        }
+        let stats = entry.stats.as_object_mut().expect("made an object above");
+        if stats.get("feedback").and_then(Value::as_str) == Some(value) {
+            stats.remove("feedback");
+        } else {
+            stats.insert("feedback".into(), json!(value));
+        }
+        self.persist();
     }
 
     /// Start an explicit export from a complete assistant answer, never an unrelated turn.
@@ -738,6 +809,11 @@ impl Workbench {
             Err(error) => self.error = Some(format!("Cannot prepare code export: {error:#}")),
         }
     }
+}
+
+/// The saved rating of an answer: "up", "down" or none.
+pub(super) fn entry_feedback(entry: &Entry) -> Option<&str> {
+    entry.stats.get("feedback").and_then(Value::as_str)
 }
 
 /// Tool rows describe recorded results, never the model's requested action.

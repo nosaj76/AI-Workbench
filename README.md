@@ -71,6 +71,16 @@ See [BUILDING.md](BUILDING.md) for every build command and option.
 3. Open **Chat**, pick a model and start typing. Use **Files → Open folder…**
    to connect a project the assistant can read.
 
+In Chat, Ctrl+Enter sends a message. To send with Enter instead (Shift+Enter
+for a new line), tick **More → Enter sends message** or the same option under
+**Settings → Chat**. After the first answer, the model that wrote it suggests a
+short title for the conversation; a conversation you have renamed keeps your
+name, and the option can be turned off in Settings. Rate answers with 👍 or 👎;
+the rating is saved with the answer. Formulas written in LaTeX (`$…$`,
+`$$…$$`, `\(…\)`, `\[…\]`) are shown as readable Unicode, e.g. `a/b + x² ≤ π`;
+this is not full typesetting, and code blocks and dollar amounts are left as
+they are.
+
 To look around without a model, run `ollama-workbench --demo`; it uses
 throwaway storage and sends no requests.
 

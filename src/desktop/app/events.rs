@@ -321,6 +321,12 @@ impl Workbench {
                         } else {
                             "Ready".into()
                         };
+                        if !self.cancel.load(Ordering::Relaxed)
+                            && self.error.is_none()
+                            && !self.compare_active
+                        {
+                            self.generate_title();
+                        }
                         self.compare_active = false;
                         // Send the next prompt typed while this reply was written.
                         // After Stop or a failure the queue waits for the user.
@@ -485,6 +491,11 @@ impl Workbench {
                     self.refresh_tree();
                     self.page = Page::Chat;
                 }
+                WorkEvent::Title {
+                    session_id,
+                    expected,
+                    title,
+                } => self.apply_generated_title(&session_id, &expected, title),
                 WorkEvent::Error(s) => {
                     self.status = "Operation failed · see error details".into();
                     self.error = Some(s);
