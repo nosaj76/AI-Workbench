@@ -282,16 +282,21 @@ impl ToolEngine {
         if let Some(branch) = branch {
             self.git_ok(&["switch", "--create", branch], false)?;
         }
-        let mut add = vec!["add", "--"];
-        if paths.is_empty() {
-            add = vec!["add", "--all", "--"];
-            add.push(".");
-        } else {
-            add.extend(paths.iter().map(String::as_str));
-        }
-        self.git_ok(&add, false)?;
         let mut commit = vec!["commit", "--no-verify", "--quiet", "-m", message];
-        if !paths.is_empty() {
+        if paths.is_empty() {
+            self.git_ok(&["add", "--all", "--", "."], false)?;
+        } else {
+            // A path-limited commit already takes tracked content from the worktree.
+            // Register new paths, skipping deletions that may already be staged.
+            let mut add = vec!["add", "--intent-to-add", "--"];
+            for path in paths {
+                if self.workspace.resolve(path, true)?.try_exists()? {
+                    add.push(path.as_str());
+                }
+            }
+            if add.len() > 3 {
+                self.git_ok(&add, false)?;
+            }
             commit.extend(["--only", "--"]);
             commit.extend(paths.iter().map(String::as_str));
         }
@@ -347,11 +352,12 @@ mod tests {
         std::fs::write(dir.path().join("unrelated"), "work in progress").unwrap();
         git(dir.path(), &["add", "unrelated"]);
         std::fs::write(dir.path().join("selected"), "new file").unwrap();
+        git(dir.path(), &["rm", "a.txt"]);
         let PreparedTool::Approval(action) = engine.prepare(
-            "git_commit", &json!({"message":"selected only","paths":["selected"]})
+            "git_commit", &json!({"message":"selected only","paths":["a.txt", "selected"]})
         ).unwrap() else { panic!("expected preview") };
         engine.approve(&action).unwrap();
-        assert_eq!(engine.git_ok(&["diff", "--name-only", "HEAD^", "HEAD"], true).unwrap().trim(), "selected");
+        assert_eq!(engine.git_ok(&["diff", "--name-only", "HEAD^", "HEAD"], true).unwrap().trim(), "a.txt\nselected");
         assert_eq!(engine.git_ok(&["diff", "--cached", "--name-only"], true).unwrap().trim(), "unrelated");
     }
 

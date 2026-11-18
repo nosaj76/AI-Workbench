@@ -160,7 +160,8 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     app.work_tx
         .send(WorkEvent::Preview {
             source_text: true,
-            truncated: false,            request_id: 1,
+            truncated: false,
+            request_id: 1,
             root: "fixture-project".into(),
             path: "old.txt".into(),
             text: "old preview".into(),
@@ -172,7 +173,8 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     app.work_tx
         .send(WorkEvent::Preview {
             source_text: true,
-            truncated: false,            request_id: 2,
+            truncated: false,
+            request_id: 2,
             root: "fixture-project".into(),
             path: "new.txt".into(),
             text: "selected preview".into(),
@@ -182,6 +184,57 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     app.receive_events();
     assert_eq!(app.preview, "selected preview");
     assert_eq!(app.preview_path, "new.txt");
+}
+
+#[test]
+fn an_extracted_or_partial_preview_cannot_request_an_overwrite() {
+    let (dir, _ctx, mut app) = fixture();
+    app.session.project = Some(dir.path().display().to_string());
+    app.preview_request_id = 1;
+    for (path, source_text, truncated) in [
+        ("scan.bmp", false, false),
+        ("scan.tif", false, false),
+        ("scan.tiff", false, false),
+        ("large.txt", true, true),
+    ] {
+        let original = b"original file bytes";
+        std::fs::write(dir.path().join(path), original).unwrap();
+        app.work_tx.send(WorkEvent::Preview {
+            request_id: 1,
+            root: dir.path().display().to_string(),
+            path: path.into(),
+            source_text,
+            truncated,
+            text: "extracted preview".into(),
+            note: String::new(),
+        }).unwrap();
+        app.receive_events();
+        app.preview = "edited preview".into();
+        assert!(!app.can_save_preview_edit());
+        app.review_preview_edit();
+        assert!(!app.work_busy && app.approval.is_none());
+        assert_eq!(std::fs::read(dir.path().join(path)).unwrap().as_slice(), original);
+    }
+}
+
+#[test]
+fn saving_divergent_window_edits_keeps_both_conversations() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.persist();
+    let original_id = app.session.id.clone();
+    let other = Store::open(dir.path()).unwrap();
+    let mut newer = other.load(&original_id).unwrap();
+    newer.title = "Changed in another window".into();
+    other.save(&mut newer).unwrap();
+
+    app.session.title = "Edited here".into();
+    app.persist();
+    assert_ne!(app.session.id, original_id);
+    assert_eq!(other.load(&original_id).unwrap().title, newer.title);
+    assert_eq!(other.load(&app.session.id).unwrap().title, "Edited here · recovered edits");
+    assert_eq!(Settings::load(dir.path()).unwrap().last_session.as_deref(), Some(app.session.id.as_str()));
 }
 
 #[test]

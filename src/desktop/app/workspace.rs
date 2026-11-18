@@ -336,6 +336,23 @@ impl Workbench {
         });
     }
 
+    pub(super) fn can_save_preview_edit(&self) -> bool {
+        self.preview_source_text && !self.preview_truncated && self.preview != self.preview_original
+    }
+
+    pub(super) fn review_preview_edit(&mut self) {
+        if !self.can_save_preview_edit() {
+            return;
+        }
+        match self.workspace().and_then(|ws| ws.read_text(&self.preview_path, 200_000)) {
+            Ok(current) if current.source_text && !current.truncated && current.text == self.preview_original => {
+                self.manual_tool("write_file", json!({"path": self.preview_path, "content": self.preview}));
+            }
+            Ok(_) => self.error = Some("The file changed since you opened it. Reload before saving this edit.".into()),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
     pub(super) fn files_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Local files");
         ui.label("Choose the folder the assistant may inspect. File references stay attached to the conversation.");
@@ -503,7 +520,10 @@ impl Workbench {
                 ui.label(RichText::new(&self.preview_path).strong());ui.label(RichText::new(&self.preview_note).small());if !self.preview_source_text{ui.label(RichText::new("Extracted document text: attach for review; editing cannot overwrite this document format.").small().color(ui.visuals().warn_fg_color));}
                 ui.horizontal_wrapped(|ui|{if ui.add_enabled(!self.work_busy,egui::Button::new("Attach to chat")).clicked(){if let Ok(ws)=self.workspace(){if let Ok(path)=ws.resolve(&self.preview_path,false){self.attach_files(vec![path]);}}}
 if ui.button("Review file").clicked(){if let Ok(ws)=self.workspace(){if let Ok(path)=ws.resolve(&self.preview_path,false){self.input=format!("Review {} thoroughly. Explain its purpose, find concrete problems, and cite source lines.",self.preview_path);self.attach_files(vec![path]);}}}
-if ui.add_enabled(self.preview!=self.preview_original&&!self.preview_truncated&&self.preview_source_text,egui::Button::new("Review & save edit")).clicked(){match self.workspace().and_then(|w|w.read_text(&self.preview_path,200_000)){Ok(current)if current.source_text && !current.truncated && current.text==self.preview_original=>self.manual_tool("write_file",json!({"path":self.preview_path,"content":self.preview})),Ok(_)=>self.error=Some("The file changed since you opened it. Reload before saving this edit.".into()),Err(e)=>self.error=Some(e.to_string())}}});
+                    if ui.add_enabled(self.can_save_preview_edit(), egui::Button::new("Review & save edit")).clicked() {
+                        self.review_preview_edit();
+                    }
+                });
                 if !self.preview_source_text && ui.button("Export preview as text…").clicked() {
                     let destination = format!("{}.txt", self.preview_path);
                     self.manual_tool("write_file", json!({"path":destination,"content":self.preview}));
