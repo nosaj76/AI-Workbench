@@ -230,8 +230,19 @@ impl Store {
     pub fn save(&self, session: &mut Session) -> Result<()> {
         let saved = session.saved.as_ref().filter(|v| v.id == session.id);
         let fingerprint: [u8; 32] = Sha256::digest(serde_json::to_vec(session)?).into();
-        if saved.is_none_or(|v| v.fingerprint != fingerprint) {
-            let revision = saved.map(|v| v.revision);
+        let revision = saved.map(|v| v.revision);
+        if saved.is_some_and(|v| v.fingerprint == fingerprint) {
+            // Diagnostics may need repairing even for an unchanged session, but
+            // an idle window must not re-export an obsolete or deleted version.
+            let current: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND revision=?2)",
+                params![session.id, revision],
+                |row| row.get(0),
+            )?;
+            if !current {
+                return Ok(());
+            }
+        } else {
             let previous_time = std::mem::replace(&mut session.updated_at, Utc::now().to_rfc3339());
             let result = self.write_session(session, revision);
             match result {
