@@ -166,10 +166,14 @@ impl ToolEngine {
                     json!({"ok":result.exit_code==Some(0)&&!result.timed_out&&!result.cancelled,"result":result}),
                 )
             }
-            Operation::FetchUrl { url, max_chars } => {
+            Operation::FetchUrl {
+                url,
+                max_chars,
+                local,
+            } => {
                 self.require_network()?;
                 Ok(serde_json::to_value(integrations::fetch_url(
-                    url, *max_chars,
+                    url, *max_chars, *local,
                 )?)?)
             }
             Operation::WebSearch {

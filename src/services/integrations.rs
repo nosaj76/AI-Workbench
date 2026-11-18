@@ -712,9 +712,16 @@ pub(crate) fn limited_body(response: reqwest::blocking::Response) -> Result<Vec<
     Ok(body)
 }
 
-pub fn fetch_url(value: &str, max_chars: usize) -> Result<WebPage> {
+/// Fetch an approved URL. `allow_local` is what the user approved: when false,
+/// every connection (including the first, and after any DNS change since the
+/// preview) is limited to public addresses.
+pub fn fetch_url(value: &str, max_chars: usize, allow_local: bool) -> Result<WebPage> {
     let url = validate_http_url(value)?;
-    let response = network_client_for(&url)?
+    // Literal IP addresses bypass the public-only resolver; check them here.
+    if !allow_local && is_local_destination(&url) {
+        bail!("{url} is a local or private address, but the request was approved as public. Nothing was sent.");
+    }
+    let response = build_network_client(allow_local)?
         .get(url)
         .send()?
         .error_for_status()?;
@@ -1865,6 +1872,20 @@ mod tests {
     }
 
     #[test]
+    fn a_fetch_approved_as_public_never_reaches_local_addresses() {
+        for target in [
+            "http://127.0.0.1:9/",
+            "http://localhost:9/",
+            "http://[::1]:9/",
+            "http://192.168.0.10/",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let error = fetch_url(target, 1000, false).unwrap_err().to_string();
+            assert!(error.contains("local or private"), "{target}: {error}");
+        }
+    }
+
+    #[test]
     fn approved_local_url_still_follows_local_redirects() {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1880,7 +1901,7 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        let page = fetch_url(&format!("http://127.0.0.1:{port}/start"), 1000).unwrap();
+        let page = fetch_url(&format!("http://127.0.0.1:{port}/start"), 1000, true).unwrap();
         server.join().unwrap();
         assert_eq!(page.content, "hello");
         assert!(page.url.ends_with("/final"), "{}", page.url);

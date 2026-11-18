@@ -296,7 +296,7 @@ impl ToolEngine {
                 let details = command_preview(&spec);
                 expected.push(state);
                 let description = match &spec.sandbox {
-                    Some(policy) => format!("Runs in a sandbox: it can change files only in the project folder, cannot see your home folder{}. Only the exact executable and arguments shown are approved.", if policy.network { ", and may use the network" } else { ", and has no network" }),
+                    Some(policy) => format!("Runs in a sandbox: it can change files only in the project folder, cannot see your home folder{}. Only the exact executable and arguments shown are approved.", if policy.network { ", and may use the network, including services on this computer such as Ollama" } else { ", and has no network" }),
                     None => "This command is not sandboxed. It can read, change files, or use the network with your OS permissions. Only the exact executable and arguments shown are approved.".into(),
                 };
                 (
@@ -337,7 +337,7 @@ impl ToolEngine {
                 details["language"] = json!("python");
                 expected.push(state);
                 let description = match &spec.sandbox {
-                    Some(policy) => format!("Run this Python code in the sandbox: it can change files only in the project folder{}.", if policy.network { " and may use the network" } else { " and has no network" }),
+                    Some(policy) => format!("Run this Python code in the sandbox: it can change files only in the project folder{}.", if policy.network { " and may use the network, including services on this computer such as Ollama" } else { " and has no network" }),
                     None => "The command sandbox is off: this Python code runs with your OS permissions.".into(),
                 };
                 (
@@ -350,13 +350,26 @@ impl ToolEngine {
             "fetch_url" => {
                 self.require_network()?;
                 let url = required(args, "url")?;
-                integrations::validate_http_url(&url)?;
+                let parsed = integrations::validate_http_url(&url)?;
+                let local = integrations::is_local_destination(&parsed);
                 let max_chars = uint(args, "max_chars", 16000, 1000, 4_000_000);
                 (
-                    "Fetch a page".into(),
-                    "Send an HTTP request to this URL. Redirects may contact another host.".into(),
-                    json!({"url":url,"max_chars":max_chars}),
-                    Operation::FetchUrl { url, max_chars },
+                    if local {
+                        "Fetch from this computer or local network".into()
+                    } else {
+                        "Fetch a page".into()
+                    },
+                    if local {
+                        "Send an HTTP request to a local or private address (this computer, your LAN or a metadata service). This always asks, even with web actions approved automatically.".into()
+                    } else {
+                        "Send an HTTP request to this public URL. Redirects may contact another public host; local and private addresses are refused.".into()
+                    },
+                    json!({"url":url,"max_chars":max_chars,"destination":if local { "local" } else { "public" }}),
+                    Operation::FetchUrl {
+                        url,
+                        max_chars,
+                        local,
+                    },
                 )
             }
             "qa_lookup" => {
