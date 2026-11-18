@@ -58,7 +58,7 @@ pub(super) fn finish(
     } else {
         stages.push("authorized");
         stages.push("executing");
-        if super::execution::tool_succeeded(result) {
+        if super::turn_helpers::tool_succeeded(result) {
             stages.push("executed");
             match verify(tool, arguments, root) {
                 Some(Ok(evidence)) => {
@@ -290,7 +290,7 @@ mod tests {
         );
         assert_eq!(record["state"], "verification_failed");
         assert_eq!(result["ok"], false);
-        assert!(!super::super::execution::tool_succeeded(&result));
+        assert!(!super::super::turn_helpers::tool_succeeded(&result));
     }
 
     #[test]

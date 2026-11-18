@@ -435,7 +435,7 @@ impl TerminalProgress {
                 });
             }
         }
-        if !super::execution::tool_succeeded(result)
+        if !super::turn_helpers::tool_succeeded(result)
             || result
                 .get("input_may_have_been_sent")
                 .and_then(Value::as_bool)
