@@ -329,9 +329,19 @@ mod tests {
             ..Default::default()
         });
         engine.set_check_mode(CheckMode::Auto);
-        let bad = approve_write(&engine, "src/main.rs", "fn main() { let x: u8 = \"no\"; }\n");
+        let bad = approve_write(
+            &engine,
+            "src/main.rs",
+            "fn main() { let x: u8 = \"no\"; }\n",
+        );
         assert_eq!(bad["check"]["passed"], false, "{bad}");
-        assert!(bad["check"]["diagnostics"].as_str().unwrap().contains("mismatched types"), "{bad}");
+        assert!(
+            bad["check"]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .contains("mismatched types"),
+            "{bad}"
+        );
         let good = approve_write(&engine, "src/main.rs", "fn main() { let _x: u8 = 1; }\n");
         assert_eq!(good["check"]["passed"], true, "{good}");
     }

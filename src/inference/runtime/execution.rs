@@ -92,6 +92,14 @@ pub(super) async fn run_chat(
             )
         });
     }
+    if !explicit_web_search {
+        let terminal_in_use = terminal_request.is_some()
+            || has_terminal_session_history(&job.messages)
+            || engine
+                .as_ref()
+                .is_some_and(|engine| !engine.terminal_manager().ai_list().is_empty());
+        scope_tools_to_turn(&mut definitions, &memory_user, terminal_in_use);
+    }
     if terminal_request.is_some()
         && !definitions.iter().any(|definition| {
             definition.pointer("/function/name").and_then(Value::as_str) == Some("terminal_open")
