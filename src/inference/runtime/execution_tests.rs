@@ -861,3 +861,55 @@ mod boundary_failure_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tool_scope_tests {
+    use super::*;
+
+    fn names(definitions: &[Value]) -> Vec<String> {
+        definitions
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn ordinary_turns_drop_terminal_adapter_and_git_schemas() {
+        let settings = Settings::default();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let engine = configured_engine(
+            &settings,
+            crate::files::Workspace::new(directory.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        let all = engine.definitions();
+        let size = |d: &[Value]| serde_json::to_string(d).unwrap().chars().count();
+
+        let mut plain = all.clone();
+        scope_tools_to_turn(&mut plain, "Fix the off-by-one bug in src/lib.rs", false);
+        let kept = names(&plain);
+        assert!(kept.contains(&"read_file".to_string()));
+        assert!(kept.contains(&"replace_text".to_string()));
+        assert!(!kept
+            .iter()
+            .any(|n| n.starts_with("terminal_") || n.starts_with("git_")));
+        assert!(
+            size(&all) - size(&plain) > 3_000,
+            "saved {}",
+            size(&all) - size(&plain)
+        );
+
+        let mut terminal = all.clone();
+        scope_tools_to_turn(&mut terminal, "open bash and run the tests", false);
+        assert!(names(&terminal).contains(&"terminal_write".to_string()));
+        let mut resumed = all.clone();
+        scope_tools_to_turn(&mut resumed, "now try again", true);
+        assert!(names(&resumed).contains(&"terminal_read".to_string()));
+
+        let mut git = all.clone();
+        scope_tools_to_turn(&mut git, "Commit my changes on a new branch", false);
+        assert!(names(&git).contains(&"git_commit".to_string()));
+        assert!(!names(&git).contains(&"terminal_open".to_string()));
+    }
+}

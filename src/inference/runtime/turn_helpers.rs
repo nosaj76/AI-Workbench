@@ -1122,3 +1122,86 @@ pub(super) fn boundary_failure_class(result: &Value) -> Option<&'static str> {
         None
     }
 }
+
+const TERMINAL_TOOLS: [&str; 7] = [
+    "terminal_open",
+    "terminal_list",
+    "terminal_read",
+    "terminal_write",
+    "terminal_key",
+    "terminal_resize",
+    "terminal_close",
+];
+const ADAPTER_TOOLS: [&str; 2] = ["list_adapters", "run_adapter"];
+const GIT_TOOLS: [&str; 4] = ["git_status", "git_diff", "git_log", "git_commit"];
+
+fn mentions_any(text: &str, words: &[&str]) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let tokens: HashSet<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    words.iter().any(|word| {
+        if word.contains(' ') {
+            lower.contains(word)
+        } else {
+            tokens.contains(word)
+        }
+    })
+}
+
+/// Drop tool groups this turn clearly does not need, so their schemas do not
+/// crowd the conversation out of a small context. Only the advertised list
+/// changes: a native call to a dropped tool still goes through approval as
+/// usual. `terminal_in_use` covers a terminal request, earlier terminal
+/// results in the conversation, or terminals the AI already has open.
+pub(super) fn scope_tools_to_turn(definitions: &mut Vec<Value>, user: &str, terminal_in_use: bool) {
+    let terminal = terminal_in_use
+        || mentions_any(
+            user,
+            &[
+                "terminal",
+                "shell",
+                "bash",
+                "zsh",
+                "console",
+                "repl",
+                "interactive",
+                "tty",
+                "cli",
+                "command line",
+                "modernbasic",
+            ],
+        );
+    let adapters = mentions_any(
+        user,
+        &[
+            "speak",
+            "speech",
+            "aloud",
+            "transcribe",
+            "transcription",
+            "audio",
+            "voice",
+            "tts",
+            "adapter",
+            "adapters",
+        ],
+    );
+    let git = mentions_any(
+        user,
+        &[
+            "git", "commit", "commits", "branch", "branches", "diff", "staged", "stage", "changes",
+            "changed", "revert", "merge", "history",
+        ],
+    );
+    definitions.retain(|definition| {
+        let name = definition
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        (terminal || !TERMINAL_TOOLS.contains(&name))
+            && (adapters || !ADAPTER_TOOLS.contains(&name))
+            && (git || !GIT_TOOLS.contains(&name))
+    });
+}
