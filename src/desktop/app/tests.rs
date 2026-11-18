@@ -1212,3 +1212,210 @@ fn repeated_conflicts_do_not_stack_the_recovered_suffix() {
     }
     assert_eq!(app.session.title, "Notes · recovered edits");
 }
+
+fn click(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn enter(modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+/// Focus the composer by clicking it, type `text`, then press Enter with `modifiers`.
+fn type_and_press_enter(enter_sends: bool, modifiers: egui::Modifiers) -> Workbench {
+    let (_dir, ctx, mut app) = fixture();
+    let size = [1366.0, 768.0];
+    app.page = Page::Chat;
+    app.settings.enter_sends = enter_sends;
+    let output = frame(&mut app, &ctx, size, vec![]);
+    let field = visible_label(&output, "Type a message...", size).center();
+    frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(field), click(field, true)]);
+    frame(&mut app, &ctx, size, vec![click(field, false)]);
+    frame(&mut app, &ctx, size, vec![egui::Event::Text("hello".into())]);
+    // Like a real window: the held modifiers are set globally and on the key event.
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]))),
+            modifiers,
+            events: vec![enter(modifiers)],
+            ..Default::default()
+        },
+        |ctx| app.render(ctx),
+    );
+    frame(&mut app, &ctx, size, vec![]);
+    app
+}
+
+#[test]
+fn enter_sends_only_when_chosen_and_shift_enter_adds_a_line() {
+    // Demo mode refuses to contact Ollama with this error, which shows a send was attempted.
+    let sent = |app: &Workbench| app.error.as_deref().is_some_and(|e| e.contains("--demo"));
+
+    let app = type_and_press_enter(true, egui::Modifiers::NONE);
+    assert!(sent(&app), "Enter should send: {:?}", app.error);
+    assert_eq!(app.input, "hello");
+
+    let app = type_and_press_enter(true, egui::Modifiers::SHIFT);
+    assert!(!sent(&app));
+    assert_eq!(app.input, "hello\n");
+
+    let app = type_and_press_enter(false, egui::Modifiers::NONE);
+    assert!(!sent(&app));
+    assert_eq!(app.input, "hello\n");
+
+    let app = type_and_press_enter(false, egui::Modifiers::CTRL);
+    assert!(sent(&app), "Ctrl+Enter always sends: {:?}", app.error);
+}
+
+#[test]
+fn answer_feedback_toggles_and_is_saved() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.session.entries.push(Entry::new(ChatMessage { role: "user".into(), content: "Q".into(), ..Default::default() }));
+    app.session.entries.push(Entry::new(ChatMessage { role: "assistant".into(), content: "A".into(), ..Default::default() }));
+    let user_id = app.session.entries[0].id.clone();
+    let answer_id = app.session.entries[1].id.clone();
+    app.set_feedback(&answer_id, "up");
+    assert_eq!(chat::entry_feedback(&app.session.entries[1]), Some("up"));
+    app.set_feedback(&answer_id, "down");
+    let saved = Store::open(dir.path()).unwrap().load(&app.session.id).unwrap();
+    assert_eq!(chat::entry_feedback(&saved.entries[1]), Some("down"));
+    app.set_feedback(&answer_id, "down");
+    assert_eq!(chat::entry_feedback(&app.session.entries[1]), None);
+    // Only answers can be rated.
+    app.set_feedback(&user_id, "up");
+    assert_eq!(chat::entry_feedback(&app.session.entries[0]), None);
+}
+
+#[test]
+fn model_replies_are_cleaned_into_short_titles() {
+    use conversations::clean_title;
+    assert_eq!(clean_title("\"Rust Error Handling Basics.\"").as_deref(), Some("Rust Error Handling Basics"));
+    assert_eq!(clean_title("Title: Baking Sourdough Bread").as_deref(), Some("Baking Sourdough Bread"));
+    assert_eq!(clean_title("<think>The user asks about...</think>\n\n**Linux Disk Cleanup**\nMore text").as_deref(), Some("Linux Disk Cleanup"));
+    assert_eq!(clean_title("# Planning a Garden").as_deref(), Some("Planning a Garden"));
+    assert!(clean_title("   \n  ").is_none());
+    assert!(clean_title("<think>only thinking</think>").is_none());
+    let long = clean_title(&"word ".repeat(40)).unwrap();
+    assert!(long.chars().count() <= 60 && !long.ends_with(' '));
+}
+
+#[test]
+fn a_generated_title_never_replaces_a_rename() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session { title: "How do I fix this borrow checker error".into(), ..Default::default() };
+    app.persist();
+    let id = app.session.id.clone();
+    app.session.title = "My rename".into();
+    app.apply_generated_title(&id, "How do I fix this borrow checker error", "Borrow Checker Fix".into());
+    assert_eq!(app.session.title, "My rename");
+    app.session.title = "How do I fix this borrow checker error".into();
+    app.apply_generated_title(&id, "How do I fix this borrow checker error", "Borrow Checker Fix".into());
+    assert_eq!(app.session.title, "Borrow Checker Fix");
+    // A conversation the user has left is updated in storage.
+    let mut other = Session { title: "Old automatic title".into(), ..Default::default() };
+    app.store.save(&mut other).unwrap();
+    app.apply_generated_title(&other.id, "Old automatic title", "New Title".into());
+    assert_eq!(Store::open(dir.path()).unwrap().load(&other.id).unwrap().title, "New Title");
+}
+
+#[test]
+fn the_first_answer_gets_a_title_from_the_model_that_wrote_it() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..n]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text[..head_end]
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let body = "{\"message\":{\"role\":\"assistant\",\"content\":\"\\\"Sourdough Starter Care.\\\"\"},\"done\":false}\n{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        String::from_utf8_lossy(&request).to_string()
+    });
+    let (_dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.settings.base_url = format!("http://{address}");
+    let question = "How often should I feed a sourdough starter that lives in the fridge?";
+    app.session = Session { title: question.chars().take(52).collect(), ..Default::default() };
+    let mut user = Entry::new(ChatMessage { role: "user".into(), content: question.into(), ..Default::default() });
+    user.display = Some(question.into());
+    let mut answer = Entry::new(ChatMessage { role: "assistant".into(), content: "Once a week.".into(), ..Default::default() });
+    answer.model = "writer-model".into();
+    app.session.entries = vec![user, answer];
+    app.generate_title();
+    let request = server.join().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.session.title != "Sourdough Starter Care" && std::time::Instant::now() < deadline {
+        app.receive_events();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(app.session.title, "Sourdough Starter Care");
+    assert!(request.contains("\"model\":\"writer-model\""), "{request}");
+    assert!(request.contains("\"think\":false"), "{request}");
+    assert!(!request.contains("\"tools\""), "{request}");
+}
+
+#[test]
+fn titles_are_not_generated_when_off_renamed_or_after_later_turns() {
+    let (_dir, _ctx, mut app) = fixture();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    app.demo = false;
+    app.settings.base_url = format!("http://{}", listener.local_addr().unwrap());
+    let user = |text: &str| Entry::new(ChatMessage { role: "user".into(), content: text.into(), ..Default::default() });
+    let answer = || { let mut e = Entry::new(ChatMessage { role: "assistant".into(), content: "A".into(), ..Default::default() }); e.model = "m".into(); e };
+    app.session = Session { title: "Question".into(), entries: vec![user("Question"), answer()], ..Default::default() };
+    app.settings.auto_titles = false;
+    app.generate_title();
+    app.settings.auto_titles = true;
+    app.session.title = "Renamed".into();
+    app.generate_title();
+    app.session.title = "Question".into();
+    app.session.entries.extend([user("Second"), answer()]);
+    app.generate_title();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn formulas_in_answers_are_shown_as_readable_math() {
+    let (_dir, ctx, mut app) = fixture();
+    let size = [1366.0, 768.0];
+    app.page = Page::Chat;
+    app.session.entries.push(Entry::new(ChatMessage { role: "user".into(), content: "Area?".into(), ..Default::default() }));
+    app.session.entries.push(Entry::new(ChatMessage {
+        role: "assistant".into(),
+        content: r"The area is $\pi r^2$ and it costs $5 and $10.".into(),
+        ..Default::default()
+    }));
+    frame(&mut app, &ctx, size, vec![]);
+    let output = frame(&mut app, &ctx, size, vec![]);
+    visible_label(&output, "The area is π r² and it costs $5 and $10.", size);
+}

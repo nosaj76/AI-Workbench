@@ -200,6 +200,12 @@ impl Workbench {
                 ),
             };
             ui.separator();
+            ui.heading("Chat");
+            ui.checkbox(&mut draft.enter_sends, "Enter sends a message")
+                .on_hover_text("Shift+Enter adds a new line. When off, Ctrl+Enter sends and Enter adds a new line.");
+            ui.checkbox(&mut draft.auto_titles, "Name new conversations automatically")
+                .on_hover_text("After the first answer, the same model suggests a short title. A conversation you have renamed is never changed.");
+            ui.separator();
             ui.heading("Appearance");
             ui.label("The Light and Dark toolbar buttons apply and save immediately. Scale below applies when settings are saved.");
             ui.horizontal(|ui| {

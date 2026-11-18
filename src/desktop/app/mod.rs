@@ -7,6 +7,7 @@ mod events;
 mod inspector;
 mod knowledge;
 mod lifecycle;
+mod math;
 mod models;
 mod preferences;
 mod shell;
@@ -60,6 +61,12 @@ struct Attachment {
 }
 
 enum WorkEvent {
+    /// A model-written title for a conversation that still has `expected` as its title.
+    Title {
+        session_id: String,
+        expected: String,
+        title: String,
+    },
     Models {
         request_id: u64,
         endpoint: String,

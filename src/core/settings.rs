@@ -47,6 +47,10 @@ pub struct Settings {
     pub agent_max_tasks: usize,
     pub dark_mode: bool,
     pub font_scale: f32,
+    /// Enter sends a chat message (Shift+Enter adds a line). Off: Ctrl+Enter sends.
+    pub enter_sends: bool,
+    /// After a conversation's first answer, ask the same model for a short title.
+    pub auto_titles: bool,
     pub temperature: f32,
     pub num_ctx: u32,
     pub num_predict: i32,
@@ -150,6 +154,8 @@ impl Default for Settings {
             agent_max_tasks: 4,
             dark_mode: false,
             font_scale: 1.0,
+            enter_sends: false,
+            auto_titles: true,
             temperature: 0.6,
             num_ctx: 8192,
             num_predict: -1,

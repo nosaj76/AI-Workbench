@@ -208,4 +208,142 @@ impl Workbench {
             Err(error) => self.error = Some(format!("Delete conversation: {error:#}")),
         }
     }
+
+    /// After the first answer, ask the model that wrote it for a short title.
+    /// Only a title still equal to the automatic one (the start of the first
+    /// message) is replaced, so a rename always wins.
+    pub(super) fn generate_title(&mut self) {
+        if self.demo || !self.settings.auto_titles {
+            return;
+        }
+        let mut users = self.session.entries.iter().filter(|e| e.message.role == "user");
+        let (Some(first), None) = (users.next(), users.next()) else {
+            return;
+        };
+        let question = first.display.clone().unwrap_or_else(|| first.message.content.clone());
+        let expected: String = question.chars().take(52).collect();
+        if self.session.title != expected {
+            return;
+        }
+        let Some(answer) = self.session.entries.iter().rev().find(|e| {
+            e.message.role == "assistant"
+                && !e.message.content.trim().is_empty()
+                && e.stats.get("incomplete").and_then(Value::as_bool) != Some(true)
+        }) else {
+            return;
+        };
+        let model = if answer.model.trim().is_empty() {
+            self.settings.active_model().to_string()
+        } else {
+            answer.model.clone()
+        };
+        if model.is_empty()
+            || (!self.settings.allow_remote
+                && self.models.iter().any(|m| m.name == model && m.is_remote()))
+        {
+            return;
+        }
+        let excerpt = |text: &str| text.chars().take(1_500).collect::<String>();
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "You name conversations. Reply with a title of at most six words and nothing else: no quotes, no punctuation at the end, no explanation.".into(),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: format!(
+                    "Name this conversation.\n\n<user>\n{}\n</user>\n\n<assistant>\n{}\n</assistant>",
+                    excerpt(&question),
+                    excerpt(&answer.message.content)
+                ),
+                ..Default::default()
+            },
+        ];
+        let options = crate::ollama::ChatOptions {
+            temperature: 0.2,
+            num_ctx: 4096,
+            num_predict: 48,
+            think: Some(json!(false)),
+            keep_alive: self.settings.keep_alive.clone(),
+            ..Default::default()
+        };
+        let base_url = self.settings.base_url.clone();
+        let session_id = self.session.id.clone();
+        let tx = self.work_tx.clone();
+        std::thread::spawn(move || {
+            // A title is a convenience: any failure just keeps the automatic one.
+            let _ = crate::jobs::guarded(|| -> Result<()> {
+                let client = crate::ollama::OllamaClient::new(&base_url)?;
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                let reply = runtime.block_on(client.chat_stream(
+                    &model,
+                    &messages,
+                    &options,
+                    &[],
+                    Arc::new(AtomicBool::new(false)),
+                    |_| {},
+                ))?;
+                if let Some(title) = clean_title(&reply.content) {
+                    let _ = tx.send(WorkEvent::Title { session_id, expected, title });
+                }
+                Ok(())
+            });
+        });
+    }
+
+    pub(super) fn apply_generated_title(&mut self, session_id: &str, expected: &str, title: String) {
+        if self.session.id == session_id {
+            if self.session.title == expected {
+                self.session.title = title;
+                self.persist();
+            }
+        } else if let Ok(mut session) = self.store.load(session_id) {
+            // The user moved on to another conversation; update the saved one.
+            if session.title == expected {
+                session.title = title;
+                if self.store.save(&mut session).is_ok() {
+                    self.refresh_conversation_list();
+                }
+            }
+        }
+    }
+}
+
+/// A model reply reduced to a clean one-line title, or None if nothing usable is left.
+pub(super) fn clean_title(raw: &str) -> Option<String> {
+    let mut text = raw.to_string();
+    // Drop any reasoning a thinking model wrote into its content.
+    while let (Some(start), Some(end)) = (text.find("<think>"), text.find("</think>")) {
+        if end < start {
+            break;
+        }
+        text.replace_range(start..end + "</think>".len(), "");
+    }
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut title = line.trim_start_matches(['#', '*', '_', '`', '-', ' ']).to_string();
+    for prefix in ["title:", "conversation title:", "suggested title:"] {
+        if title.to_lowercase().starts_with(prefix) {
+            title = title[prefix.len()..].to_string();
+        }
+    }
+    let title = title
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’' | '*' | '_' | '`'))
+        .trim_end_matches(['.', ':', ';', ','])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut short = String::new();
+    for word in title.split(' ') {
+        if !short.is_empty() && short.chars().count() + 1 + word.chars().count() > 60 {
+            break;
+        }
+        if !short.is_empty() {
+            short.push(' ');
+        }
+        short.push_str(word);
+    }
+    let short: String = short.chars().take(60).collect();
+    (!short.trim().is_empty()).then_some(short)
 }
