@@ -2490,3 +2490,21 @@ fn varied_outside_workspace_calls_stop_after_three_failures() {
         .get("tools")
         .is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty)));
 }
+
+#[test]
+fn disabling_chat_tools_suppresses_the_automatic_health_lookup() {
+    let server = MockOllama::new(vec![final_answer("An ordinary chat response.")]);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let prompt = ChatMessage { role: "user".into(), content: "What is chamomile?".into(), ..Default::default() };
+    let mut job = job(&server, &root, vec![prompt]);
+    job.settings.tools_enabled = false;
+    job.settings.network_tools = true;
+    job.settings.auto_approve_web = true;
+    job.settings.local_sites_url = "http://127.0.0.1".into();
+    let result = run(job, |_| panic!("unexpected approval"));
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(!result.statuses.iter().any(|s| s.contains("Herb Helper")));
+    assert_eq!(server.chats().len(), 1);
+}

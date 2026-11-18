@@ -252,6 +252,8 @@ pub enum Operation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PathState {
+    #[serde(default)]
+    pub mode: Option<u32>,
     pub path: String,
     pub resolved: PathBuf,
     pub kind: String,
@@ -864,7 +866,7 @@ impl ToolEngine {
                 definition("project_tree", "List a bounded part of the project tree, excluding dependency/build folders. Follow next_offset or ask about a narrower subdirectory. This is discovery, NOT a complete source review.", json!({"path":path(),"max_depth":{"type":"integer","minimum":1,"maximum":12},"limit":{"type":"integer","minimum":1,"maximum":2000},"offset":{"type":"integer","minimum":0,"maximum":20000}}), &[]),
                 definition("repo_map", "A ranked outline of the project's code: the files the rest of the code relies on most, each with its key functions, types and classes and their line numbers. Use it first on a large project to decide what to read. `focus` is text naming what you care about (file names and identifiers in it raise those files). The result states how many ranked files it shows and the `offset` to continue from; it is an outline, not file content, so read_file before describing code.", json!({"focus":string(),"path":path(),"max_chars":{"type":"integer","minimum":1500,"maximum":40000},"offset":{"type":"integer","minimum":0,"maximum":100000}}), &[]),
                 definition("read_file", "Read a file as numbered lines. The whole file is returned whenever it fits in your context; only a file larger than that is split into the largest pieces that fit. The result states exactly what came back: returned_start_line..returned_end_line of total_lines, `complete`, and `next_start_line`. If next_start_line is set, call again with that start_line to continue (and start_column=next_column when it is given, because a very long line was only partly returned); never describe a file you only partly read as fully reviewed. Line numbers for extracted documents refer to the extracted text.", json!({"path":path(),"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"start_column":{"type":"integer","minimum":0,"description":"Resume inside a line that was only partly returned: pass next_column from the previous result together with the same start_line."},"expected_sha256":{"type":"string","description":"Pass source_sha256 from the previous page to detect that the file changed between pages."},"max_chars":{"type":"integer","minimum":1000,"maximum":4000000}}), &["path"]),
-                definition("search_files", "Find text in readable workspace files. The query is LITERAL text unless you set regex:true (needed for | alternation or patterns); a literal query that looks like a regex returns a warning (honoring ignore files; the result lists the excluded folder names). Check `complete`: only complete=true with zero matches means the text is absent. If complete=false the search did NOT cover everything: call again with the same query and `resume_after` set to the returned value, or narrow `path`. Files that need an external extractor (PDF/scans) are counted but not searched; read them with read_file.", json!({"query":string(),"path":path(),"case_sensitive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200},"resume_after":string(),"regex":{"type":"boolean"}}), &["query"]),
+                definition("search_files", "Find text in readable workspace files. The query is LITERAL text unless you set regex:true (needed for | alternation or patterns); a literal query that looks like a regex returns a warning (honoring ignore files; the result lists the excluded folder names). Check `complete`: only complete=true with zero matches means the text is absent. If complete=false the search did NOT cover everything: call again with the same query and `resume_after` set to the returned value and include `resume_line` when provided to continue inside that file, or narrow `path`. Files that need an external extractor (PDF/scans) are counted but not searched; read them with read_file.", json!({"query":string(),"path":path(),"case_sensitive":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":200},"resume_after":string(),"resume_line":{"type":"integer","minimum":1},"regex":{"type":"boolean"}}), &["query"]),
                 definition("write_file", "Propose UTF-8 file content. User approval is required; existing content is backed up and rechecked before writing.", json!({"path":path(),"content":string()}), &["path","content"]),
                 definition("replace_text", "Propose a text replacement. Copy the old text from the file; if its indentation, trailing spaces or line endings differ it is still found when exactly one place matches, and a failure shows the closest real lines. By default the old text must match exactly one place. User approval is required.", json!({"path":path(),"find":string(),"replacement":string(),"replace_all":{"type":"boolean"}}), &["path","find","replacement"]),
                 definition("copy_file", "Propose copying a local file. Existing destination requires overwrite=true and is backed up. User approval is required.", json!({"source":path(),"destination":path(),"overwrite":{"type":"boolean"}}), &["source","destination"]),
@@ -1732,6 +1734,36 @@ mod tests {
         }
         assert_eq!(seen, ["a.txt", "b.txt", "c.txt", "d.txt"]);
         assert!(pages >= 2);
+    }
+
+    #[test]
+    fn search_reaches_large_text_tails_and_resumes_inside_dense_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        let mut text = "x".repeat(1_050_000);
+        text.push_str("\nneedle one\nneedle two\n");
+        fs::write(dir.path().join("large.txt"), text).unwrap();
+        let first = immediate(&e, "search_files", json!({"query":"needle","limit":1}));
+        assert_eq!(first["complete"], false);
+        assert_eq!(first["matches"][0]["line"], 2);
+        let second = immediate(&e, "search_files", json!({"query":"needle","limit":1,
+            "resume_after":first["resume_after"],"resume_line":first["resume_line"]}));
+        assert_eq!(second["complete"], true);
+        assert_eq!(second["matches"][0]["line"], 3);
+    }
+
+    #[test]
+    fn unreadable_files_are_reported_without_blocking_a_complete_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        fs::write(dir.path().join("notes.txt"), "plain text\n").unwrap();
+        fs::write(dir.path().join("latin1.txt"), b"caf\xe9\n").unwrap();
+        let result = immediate(&e, "search_files", json!({"query":"absent"}));
+        assert_eq!(result["complete"], true, "{result}");
+        assert_eq!(result["files_skipped"], 1);
+        assert!(result["coverage"].as_str().unwrap().contains("could not be read"));
     }
 
     #[test]

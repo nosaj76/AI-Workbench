@@ -23,6 +23,9 @@ impl Workbench {
     }
 
     pub(super) fn refresh_models(&mut self) {
+        if self.demo {
+            return;
+        }
         self.connection_request_id = self.connection_request_id.wrapping_add(1);
         self.version.clear();
         self.models.clear();
@@ -431,6 +434,8 @@ impl Workbench {
                     }
                 }
                 WorkEvent::Preview {
+                    source_text,
+                    truncated,
                     request_id,
                     root,
                     path,
@@ -444,6 +449,8 @@ impl Workbench {
                         self.preview_original = text.clone();
                         self.preview = text;
                         self.preview_note = note;
+                        self.preview_source_text = source_text;
+                        self.preview_truncated = truncated;
                     }
                 }
                 WorkEvent::Attached(items) => {
@@ -454,8 +461,14 @@ impl Workbench {
                     self.tool_result = text;
                 }
                 WorkEvent::Status(s) => self.status = s,
-                WorkEvent::Import(session) => {
+                WorkEvent::Import(mut session) => {
                     self.persist();
+                    // Importing a conversation that is still stored must not collide
+                    // with the original; keep both.
+                    if self.store.load(&session.id).is_ok() {
+                        session.id = uuid::Uuid::new_v4().to_string();
+                        self.status = "This conversation already exists; the import was saved as a copy.".into();
+                    }
                     self.input.clear();
                     self.queued_prompts.clear();
                     self.attachments.clear();

@@ -159,6 +159,8 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     app.preview = "new preview".into();
     app.work_tx
         .send(WorkEvent::Preview {
+            source_text: true,
+            truncated: false,
             request_id: 1,
             root: "fixture-project".into(),
             path: "old.txt".into(),
@@ -170,6 +172,8 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     assert_eq!(app.preview, "new preview");
     app.work_tx
         .send(WorkEvent::Preview {
+            source_text: true,
+            truncated: false,
             request_id: 2,
             root: "fixture-project".into(),
             path: "new.txt".into(),
@@ -180,6 +184,57 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     app.receive_events();
     assert_eq!(app.preview, "selected preview");
     assert_eq!(app.preview_path, "new.txt");
+}
+
+#[test]
+fn an_extracted_or_partial_preview_cannot_request_an_overwrite() {
+    let (dir, _ctx, mut app) = fixture();
+    app.session.project = Some(dir.path().display().to_string());
+    app.preview_request_id = 1;
+    for (path, source_text, truncated) in [
+        ("scan.bmp", false, false),
+        ("scan.tif", false, false),
+        ("scan.tiff", false, false),
+        ("large.txt", true, true),
+    ] {
+        let original = b"original file bytes";
+        std::fs::write(dir.path().join(path), original).unwrap();
+        app.work_tx.send(WorkEvent::Preview {
+            request_id: 1,
+            root: dir.path().display().to_string(),
+            path: path.into(),
+            source_text,
+            truncated,
+            text: "extracted preview".into(),
+            note: String::new(),
+        }).unwrap();
+        app.receive_events();
+        app.preview = "edited preview".into();
+        assert!(!app.can_save_preview_edit());
+        app.review_preview_edit();
+        assert!(!app.work_busy && app.approval.is_none());
+        assert_eq!(std::fs::read(dir.path().join(path)).unwrap().as_slice(), original);
+    }
+}
+
+#[test]
+fn saving_divergent_window_edits_keeps_both_conversations() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.persist();
+    let original_id = app.session.id.clone();
+    let other = Store::open(dir.path()).unwrap();
+    let mut newer = other.load(&original_id).unwrap();
+    newer.title = "Changed in another window".into();
+    other.save(&mut newer).unwrap();
+
+    app.session.title = "Edited here".into();
+    app.persist();
+    assert_ne!(app.session.id, original_id);
+    assert_eq!(other.load(&original_id).unwrap().title, newer.title);
+    assert_eq!(other.load(&app.session.id).unwrap().title, "Edited here · recovered edits");
+    assert_eq!(Settings::load(dir.path()).unwrap().last_session.as_deref(), Some(app.session.id.as_str()));
 }
 
 #[test]
@@ -502,6 +557,7 @@ fn cancellation_between_tool_result_and_followup_gets_a_saved_explanation() {
 #[test]
 fn chat_tool_engine_setup_failure_is_saved_before_worker_launch() {
     let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
     app.session = Session::default();
     app.session.project = Some(dir.path().display().to_string());
     app.settings.tools_enabled = true;
@@ -1090,4 +1146,69 @@ fn background_failure_does_not_attach_to_a_previous_turn() {
         .entries
         .iter()
         .all(|e| e.stats.get("background_failures").is_none()));
+}
+
+#[test]
+fn demo_model_actions_never_start_a_worker_or_contact_ollama() {
+    let (_dir, _ctx, mut app) = fixture();
+    let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    mock.set_nonblocking(true).unwrap();
+    app.settings.base_url = format!("http://{}", mock.local_addr().unwrap());
+    let original = app.session.id.clone();
+    app.refresh_models();
+    for action in ["show", "pull", "unload", "delete", "copy", "create", "import"] {
+        app.model_action(action, "demo-model");
+    }
+    app.compare_models = "first,second".into();
+    app.start_comparison();
+    app.regenerate();
+    app.launch_chat(Vec::new(), "demo-model".into());
+    assert!(!app.busy && !app.work_busy);
+    assert_eq!(app.active_work, 0);
+    assert_eq!(app.session.id, original);
+    assert_eq!(mock.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn importing_a_stored_conversation_keeps_both_copies() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.session.title = "Original".into();
+    app.persist();
+    let original_id = app.session.id.clone();
+    let imported = Session {
+        id: original_id.clone(),
+        title: "Imported".into(),
+        ..Default::default()
+    };
+    app.work_tx.send(WorkEvent::Import(imported)).unwrap();
+    app.receive_events();
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_ne!(app.session.id, original_id);
+    let other = Store::open(dir.path()).unwrap();
+    assert_eq!(other.load(&original_id).unwrap().title, "Original");
+    assert_eq!(other.load(&app.session.id).unwrap().title, "Imported");
+}
+
+#[test]
+fn repeated_conflicts_do_not_stack_the_recovered_suffix() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.session.title = "Notes".into();
+    app.persist();
+    let other = Store::open(dir.path()).unwrap();
+    for round in 0..2 {
+        let mut newer = other.load(&app.session.id).unwrap();
+        newer.title = format!("Other window {round}");
+        other.save(&mut newer).unwrap();
+        app.session.entries.push(Entry::new(ChatMessage {
+            role: "user".into(),
+            content: format!("edit {round}"),
+            ..Default::default()
+        }));
+        app.persist();
+    }
+    assert_eq!(app.session.title, "Notes · recovered edits");
 }

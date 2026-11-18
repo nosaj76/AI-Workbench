@@ -294,6 +294,26 @@ const PHRASING_WORDS: &[&str] = &[
     "explain",
 ];
 
+/// Keep the order of operands and their prepositions in the cache identity.
+/// The public bag-of-words normalizer also serves note and knowledge searches.
+fn question_key(question: &str) -> String {
+    let lower = question.to_lowercase();
+    let mut words = Vec::new();
+    let mut has_subject = false;
+    for word in lower.split(|c: char| !(c.is_alphanumeric() || matches!(c, '+' | '#'))) {
+        if word.is_empty() {
+            continue;
+        }
+        if !STOPWORDS.contains(&word) {
+            words.push(word);
+            has_subject |= !PHRASING_WORDS.contains(&word);
+        } else if has_subject && matches!(word, "from" | "to" | "into") {
+            words.push(word);
+        }
+    }
+    words.join(" ")
+}
+
 fn similarity(a: &str, b: &str) -> f64 {
     if a == b {
         return 1.0;
@@ -312,7 +332,37 @@ fn similarity(a: &str, b: &str) -> f64 {
             all.into_iter().map(str::to_owned).collect()
         }
     };
-    let (a, b) = (significant(a), significant(b));
+    let (left, right) = (significant(a), significant(b));
+    // A changed direction or reversed operands cannot reuse the old answer.
+    for word in ["to", "from", "into"] {
+        if left.contains(word) != right.contains(word) {
+            return 0.0;
+        }
+    }
+    // Each direction word must point at the same operand ("to fahrenheit" is
+    // not "to celsius"); the rest of the word order is free.
+    let direction = |text: &str| -> BTreeSet<(String, String)> {
+        let words: Vec<&str> = text
+            .split_whitespace()
+            .filter(|w| left.contains(*w) && right.contains(*w))
+            .collect();
+        let mut pairs = BTreeSet::new();
+        for (i, word) in words.iter().enumerate() {
+            if matches!(*word, "to" | "from" | "into") {
+                let next = words[i + 1..]
+                    .iter()
+                    .find(|w| !matches!(**w, "to" | "from" | "into"))
+                    .copied()
+                    .unwrap_or("");
+                pairs.insert((word.to_string(), next.to_string()));
+            }
+        }
+        pairs
+    };
+    if direction(a) != direction(b) {
+        return 0.0;
+    }
+    let (a, b) = (left, right);
     if a == b && a.len() >= 3 {
         return 1.0;
     }
@@ -581,7 +631,7 @@ impl QaCache {
     pub fn open(dir: &Path) -> Result<Self> {
         let library = dir.join(LIBRARY_DIR);
         fs::create_dir_all(&library)?;
-        let conn = Connection::open(dir.join("qa_cache.sqlite3"))?;
+        let mut conn = Connection::open(dir.join("qa_cache.sqlite3"))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -606,6 +656,23 @@ impl QaCache {
                 id UNINDEXED, question, answer, explanation, topic, tokenize='unicode61'
              );",
         )?;
+        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 0 {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 0 {
+                let questions = {
+                    let mut stmt = tx.prepare("SELECT id,json_extract(record,'$.question') FROM qa_library")?;
+                    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                // Avoid temporary conflicts with keys that have yet to be migrated.
+                tx.execute("UPDATE qa_library SET normalized=':' || id", [])?;
+                for (id, question) in questions {
+                    tx.execute("UPDATE qa_library SET normalized=?1 WHERE id=?2", params![question_key(&question), id])?;
+                }
+                tx.pragma_update(None, "user_version", 1)?;
+            }
+            tx.commit()?;
+        }
         let cache = Self { conn, library };
         let empty: i64 = cache
             .conn
@@ -628,7 +695,7 @@ impl QaCache {
     }
 
     fn put(&self, entry: &CachedQa) -> Result<()> {
-        let key = normalize_question(&entry.question);
+        let key = question_key(&entry.question);
         if key.is_empty() {
             bail!("The question has no searchable words");
         }
@@ -766,13 +833,16 @@ impl QaCache {
     /// The best saved entry for this question (the same question, or a
     /// reworded one), whether or not it is due for a refresh.
     pub fn lookup(&self, question: &str) -> Result<Option<CachedQa>> {
-        let key = normalize_question(question);
+        let key = question_key(question);
         if key.is_empty() {
             return Ok(None);
         }
+        if let Some(hit) = self.exact(&key)? {
+            return Ok(Some(hit));
+        }
         let mut statement = self
             .conn
-            .prepare("SELECT normalized, record, hits FROM qa_library")?;
+            .prepare("SELECT normalized, record, hits FROM qa_library ORDER BY saved_at DESC,id")?;
         let mut best: Option<(f64, String, i64)> = None;
         for row in statement.query_map([], |r| {
             Ok((
@@ -798,6 +868,18 @@ impl QaCache {
     /// Save a new answer for a question. An existing entry keeps its file and
     /// ID; its previous answer moves to the file's "Previous answers".
     pub fn store(&self, new: NewAnswer<'_>, changing_days: u32) -> Result<CachedQa> {
+        self.store_match(new, changing_days, None)
+    }
+
+    fn exact(&self, key: &str) -> Result<Option<CachedQa>> {
+        let row = self.conn.query_row(
+            "SELECT record,hits FROM qa_library WHERE normalized=?1", [key],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        ).optional()?;
+        Ok(row.and_then(|(record, hits)| Self::decode(&record, hits)))
+    }
+
+    pub fn store_match(&self, new: NewAnswer<'_>, changing_days: u32, matched_id: Option<&str>) -> Result<CachedQa> {
         let NewAnswer {
             question,
             summary,
@@ -809,19 +891,14 @@ impl QaCache {
             kind,
             topic,
         } = new;
-        let key = normalize_question(question);
+        let key = question_key(question);
         if key.is_empty() {
             bail!("The question has no searchable words");
         }
-        let existing = self
-            .conn
-            .query_row(
-                "SELECT record, hits FROM qa_library WHERE normalized = ?1",
-                params![key],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-            )
-            .optional()?
-            .and_then(|(record, hits)| Self::decode(&record, hits));
+        let existing = match matched_id {
+            Some(id) => Some(self.get(id)?.ok_or_else(|| anyhow::anyhow!("The Q&A entry was removed during refresh"))?),
+            None => self.exact(&key)?,
+        };
         let saved_at = chrono::Utc::now().to_rfc3339();
         let topic = match slug(topic, 30) {
             s if s.is_empty() => "general".to_owned(),
@@ -841,7 +918,7 @@ impl QaCache {
                     old.history.truncate(MAX_HISTORY);
                 }
                 CachedQa {
-                    question: question.trim().to_owned(),
+                    // Keep the original wording and key for this library entry.
                     summary: summary.trim().to_owned(),
                     short_question: short_question.trim().to_owned(),
                     explanation: explanation.trim().to_owned(),
@@ -1095,6 +1172,59 @@ mod tests {
         assert!(similarity(&asked, &delete) < SIMILARITY_THRESHOLD);
         let remote = normalize_question("How do I rename a remote Git branch?");
         assert!(similarity(&asked, &remote) < SIMILARITY_THRESHOLD);
+    }
+
+    #[test]
+    fn opposite_conversions_are_separate_after_upgrading_an_old_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let forward = "Convert Celsius to Fahrenheit";
+        let reverse = "Convert Fahrenheit to Celsius";
+        let save = |q, answer| new(q, answer, answer, &[], AnswerKind::Factual, "units");
+        let cache = QaCache::open(dir.path()).unwrap();
+        let first = cache.store(save(forward, "multiply by 1.8"), 30).unwrap();
+        cache.conn.execute("UPDATE qa_library SET normalized=?1", [normalize_question(forward)]).unwrap();
+        cache.conn.pragma_update(None, "user_version", 0).unwrap();
+        drop(cache);
+        let cache = QaCache::open(dir.path()).unwrap();
+        assert_eq!(cache.lookup(forward).unwrap().unwrap().id, first.id);
+        assert!(cache.lookup(reverse).unwrap().is_none());
+        let second = cache.store(save(reverse, "divide by 1.8"), 30).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(cache.lookup(reverse).unwrap().unwrap().id, second.id);
+    }
+
+    #[test]
+    fn word_order_matters_only_for_conversion_direction() {
+        let key = question_key;
+        assert_eq!(similarity(&key("git rename branch"), &key("rename git branch")), 1.0);
+        assert_eq!(
+            similarity(&key("convert from word to pdf"), &key("convert to pdf from word")),
+            1.0
+        );
+        assert_eq!(
+            similarity(&key("Convert Celsius to Fahrenheit"), &key("Convert Fahrenheit to Celsius")),
+            0.0
+        );
+        assert_eq!(
+            similarity(&key("convert word into pdf"), &key("convert pdf into word")),
+            0.0
+        );
+    }
+
+    #[test]
+    fn refreshing_a_paraphrase_updates_the_matched_record_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = QaCache::open(dir.path()).unwrap();
+        let original = "How to rename a local git branch in command line";
+        let paraphrase = "How do I rename a local Git branch?";
+        let first = cache.store(new(original, "", "old", &[], AnswerKind::Changing, "git"), 30).unwrap();
+        let hit = cache.lookup(paraphrase).unwrap().unwrap();
+        let refreshed = cache.store_match(new(paraphrase, "", "new", &[], AnswerKind::Changing, "git"), 30, Some(&hit.id)).unwrap();
+        assert_eq!(refreshed.id, first.id);
+        assert_eq!(refreshed.path, first.path);
+        assert_eq!(refreshed.history[0].answer, "old");
+        assert_eq!(cache.list(10).unwrap().len(), 1);
+        assert_eq!(cache.lookup(original).unwrap().unwrap().answer, "new");
     }
 
     #[test]

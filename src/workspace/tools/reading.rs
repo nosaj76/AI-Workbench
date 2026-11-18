@@ -161,7 +161,6 @@ impl ToolEngine {
         /// Text files read per call. A bigger workspace is continued with
         /// `resume_after`; nothing is silently left unsearched.
         const FILES_PER_CALL: usize = 10_000;
-        const MATCHES_PER_FILE: usize = 200;
         const SHOWN_EXAMPLES: usize = 25;
         let query = required(args, "query")?;
         if query.len() > 4096 {
@@ -197,6 +196,14 @@ impl ToolEngine {
             .and_then(Value::as_str)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
+        let resume_line = args.get("resume_line").map(|value| {
+            value.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0)
+                .context("resume_line must be a positive line number")
+        }).transpose()?;
+        if resume_line.is_some() && resume_after.is_none() {
+            bail!("resume_line requires its resume_after path");
+        }
+        let mut next_line = None;
         let mut resuming = resume_after.is_some();
         let mut matches = Vec::new();
         let mut files = 0usize;
@@ -220,13 +227,20 @@ impl ToolEngine {
                 continue;
             }
             let rel = relative(self.root(), entry.path());
+            let mut first_line = 1;
             if resuming {
-                if resume_after.as_deref() == Some(rel.as_str()) {
-                    resuming = false;
+                if resume_after.as_deref() != Some(rel.as_str()) {
+                    continue;
                 }
+                resuming = false;
+                match resume_line {
+                    Some(start) => first_line = start,
+                    None => continue,
+                }
+            }
+            if crate::files::binary_extension(entry.path()) {
                 continue;
             }
-            // Stop only between files, so a file's matches are never cut off.
             if matches.len() >= limit {
                 stopped_for = Some("match_limit");
                 break;
@@ -246,7 +260,7 @@ impl ToolEngine {
                 }
                 continue;
             }
-            let document = match self.workspace.read_text(&rel, 1024 * 1024) {
+            let document = match self.workspace.read_text(&rel, MAX_FILE_BYTES) {
                 Ok(doc) => doc,
                 Err(_) => {
                     skipped_unreadable += 1;
@@ -261,8 +275,7 @@ impl ToolEngine {
             }
             files += 1;
             last_path = Some(rel.clone());
-            let mut in_file = 0usize;
-            for (index, line) in document.text.lines().enumerate() {
+            for (index, line) in document.text.lines().enumerate().skip(first_line - 1) {
                 let hit = match &pattern {
                     Some(re) => re.is_match(line),
                     None if sensitive => line.contains(&needle),
@@ -271,11 +284,12 @@ impl ToolEngine {
                 if !hit {
                     continue;
                 }
-                if in_file >= MATCHES_PER_FILE {
+                if matches.len() >= limit {
+                    next_line = Some(index + 1);
+                    stopped_for = Some("match_limit");
                     dense_files.push(rel.clone());
                     break;
                 }
-                in_file += 1;
                 let chars = line.chars().count();
                 let mut found = json!({"path":rel,"line":index+1,"text":line.chars().take(600).collect::<String>()});
                 if chars > 600 {
@@ -284,10 +298,15 @@ impl ToolEngine {
                 }
                 matches.push(found);
             }
+            if next_line.is_some() {
+                break;
+            }
         }
         if resume_after.is_some() && resuming {
             bail!("resume_after path was not found while walking; pass the exact `resume_after` value from the previous result");
         }
+        // Unreadable or partly extracted files are reported below; they cannot be
+        // fixed by repeating the search, so they must not keep it incomplete forever.
         let complete = stopped_for.is_none();
         let coverage = if complete {
             let mut note = format!("COMPLETE: every searchable text file under `{path}` was searched ({files} files read). ");
@@ -300,9 +319,14 @@ impl ToolEngine {
                 note.push_str(&format!(" {needs_extractor_count} file(s) (PDF/scanned/image types) were NOT searched because they need an external extractor; read them with read_file."));
             }
             if partly_read_count > 0 {
-                note.push_str(&format!(" {partly_read_count} large file(s) were only searched in part (see partly_read_files)."));
+                note.push_str(&format!(" {partly_read_count} file(s) were only searched in part (see partly_read_files)."));
+            }
+            if skipped_unreadable > 0 {
+                note.push_str(&format!(" {skipped_unreadable} file(s) could not be read as UTF-8 text and were skipped (see files_skipped)."));
             }
             note
+        } else if let Some(line) = next_line {
+            format!("INCOMPLETE: continue the same query with resume_after={:?} and resume_line={line}.", last_path.as_deref().unwrap_or_default())
         } else {
             let reason = if stopped_for == Some("match_limit") {
                 "the match limit was reached"
@@ -323,7 +347,8 @@ impl ToolEngine {
             "query":query,"path":path,"matches":matches,
             "query_mode":if use_regex {"regex"} else {"literal"},"warning":warning,
             "complete":complete,"truncated":!complete,
-            "resume_after":if complete {None} else {last_path},
+            "resume_after":if stopped_for.is_some() {last_path} else {None},
+            "resume_line":next_line,
             "coverage":coverage,
             "files_searched":files,"files_skipped":skipped_unreadable,
             "skipped_needs_external_extractor":needs_extractor_count,

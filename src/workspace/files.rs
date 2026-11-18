@@ -32,6 +32,9 @@ pub struct FileEntry {
 const MAX_DIRECTORY_ENTRIES: usize = 200_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
+    /// True for original UTF-8 source. Extractor output is a separate representation.
+    #[serde(default)]
+    pub source_text: bool,
     pub path: String,
     pub text: String,
     pub truncated: bool,
@@ -429,16 +432,17 @@ impl Workspace {
         let source: &Path = snapshot
             .as_ref()
             .map_or(path.as_path(), |copy| copy.0.as_path());
-        let (text, kind, extractor_truncated) = match extension.as_str() {
+        let (text, kind, extractor_truncated, source_text) = match extension.as_str() {
             "docx" | "odt" | "pptx" | "xlsx" | "epub" => (
                 extract_zip(source, &extension)?,
                 format!("{} (extracted lines)", extension.to_uppercase()),
+                false,
                 false,
             ),
             "pdf" => {
                 let (s, t) =
                     run_extractor("pdftotext", &["-layout", "-enc", "UTF-8"], source, &["-"])?;
-                (s, "PDF (extracted lines; requires pdftotext)".into(), t)
+                (s, "PDF (extracted lines; requires pdftotext)".into(), t, false)
             }
             "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "webp" | "gif" => {
                 let (s, t) = run_extractor("tesseract", &[], source, &["stdout"])?;
@@ -446,6 +450,7 @@ impl Workspace {
                     s,
                     "Image OCR (extracted lines; requires tesseract)".into(),
                     t,
+                    false,
                 )
             }
             _ => {
@@ -481,11 +486,14 @@ impl Workspace {
                     text.trim_start_matches('\u{feff}').to_string(),
                     "UTF-8 text".into(),
                     false,
+                    !matches!(extension.as_str(), "doc" | "xls" | "ppt"),
                 )
             }
         };
-        let (text, truncated) = truncate_chars(&text, max_chars.min(MAX_EXTRACT_BYTES));
+        let cap = if source_text { MAX_FILE_BYTES as usize } else { MAX_EXTRACT_BYTES };
+        let (text, truncated) = truncate_chars(&text, max_chars.min(cap));
         Ok(Document {
+            source_text,
             path: path
                 .strip_prefix(&self.root)?
                 .to_string_lossy()
@@ -733,7 +741,7 @@ fn extension(path: &Path) -> String {
         .unwrap_or("")
         .to_ascii_lowercase()
 }
-fn binary_extension(path: &Path) -> bool {
+pub(crate) fn binary_extension(path: &Path) -> bool {
     matches!(
         extension(path).as_str(),
         "exe"
@@ -1200,6 +1208,7 @@ mod tests {
         let original = fs::read(dir.path().join("note.docx")).unwrap();
         let w = Workspace::new(dir.path().to_path_buf()).unwrap();
         let document = w.read_text("note.docx", 10_000).unwrap();
+        assert!(!document.source_text);
         assert!(
             document.text.contains("Hello from docx"),
             "{}",

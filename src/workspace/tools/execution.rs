@@ -464,7 +464,7 @@ impl ToolEngine {
                             .next()
                             .cloned()
                             .unwrap_or_else(|| "general".into());
-                        let entry = cache.store(
+                        let entry = cache.store_match(
                             crate::qa::NewAnswer {
                                 question,
                                 summary: "",
@@ -477,6 +477,7 @@ impl ToolEngine {
                                 topic: &topic,
                             },
                             crate::qa::DEFAULT_REFRESH_DAYS,
+                            saved.as_ref().map(|hit| hit.id.as_str()),
                         )?;
                         Ok(json!({
                             "ok": true,

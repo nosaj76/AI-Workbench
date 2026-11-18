@@ -4,6 +4,10 @@ use super::*;
 impl Workbench {
     pub(super) fn models_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Models");
+        if self.demo {
+            ui.label("Model management is available when you start Workbench without --demo.");
+            ui.disable();
+        }
         ui.label(
             "Use your installed Ollama models, manage their lifecycle, and inspect capabilities.",
         );
@@ -57,6 +61,9 @@ if self.work_busy&&ui.button("Cancel operation").clicked(){self.work_cancel.stor
     }
 
     pub(super) fn model_action(&mut self, action: &str, name: &str) {
+        if self.demo {
+            return;
+        }
         if self.setup.is_busy() && action != "show" {
             self.error = Some("Finish or stop specialist setup before changing models.".into());
             return;
@@ -175,6 +182,9 @@ if self.work_busy&&ui.button("Cancel operation").clicked(){self.work_cancel.stor
     }
 
     pub(super) fn start_comparison(&mut self) {
+        if self.demo {
+            return;
+        }
         if self.busy || self.work_busy || self.approval.is_some() {
             return;
         }

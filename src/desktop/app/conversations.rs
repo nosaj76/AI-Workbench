@@ -77,8 +77,21 @@ impl Workbench {
             return;
         }
         if let Err(e) = self.store.save(&mut self.session) {
-            self.error = Some(format!("Save conversation: {e:#}"));
-            return;
+            if !e.is::<storage::SessionConflict>() {
+                self.error = Some(format!("Save conversation: {e:#}"));
+                return;
+            }
+            let mut copy = self.session.clone();
+            copy.id = uuid::Uuid::new_v4().to_string();
+            if !copy.title.ends_with(" · recovered edits") {
+                copy.title = format!("{} · recovered edits", copy.title);
+            }
+            if let Err(error) = self.store.save(&mut copy) {
+                self.error = Some(format!("Save recovered conversation: {error:#}"));
+                return;
+            }
+            self.session = copy;
+            self.error = Some("Another window changed this conversation. Your edits were saved in a separate conversation.".into());
         }
         self.settings.last_session = Some(self.session.id.clone());
         if !self.settings_corrupt {

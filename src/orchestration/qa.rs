@@ -579,6 +579,7 @@ fn classify(
 fn answer_online(
     request: &QaRequest,
     cache: &QaCache,
+    matched_id: Option<&str>,
     events: &Sender<AgentEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(CachedQa, Vec<String>)> {
@@ -603,7 +604,7 @@ fn answer_online(
     )?;
     let answer = synthesize(request, &gathered.sources, events, cancel.clone())?;
     let class = classify(request, &answer, &gathered.sources, events, cancel);
-    let entry = cache.store(
+    let entry = cache.store_match(
         NewAnswer {
             question,
             summary: &class.summary,
@@ -616,6 +617,7 @@ fn answer_online(
             topic: &class.topic,
         },
         request.refresh_days,
+        matched_id,
     )?;
     Ok((entry, gathered.notes))
 }
@@ -682,7 +684,7 @@ pub fn run_qa(
     if saved.is_some() {
         agents::status(events, &format!("Refreshing a saved answer ({why})…"));
     }
-    match answer_online(&request, &cache, events, cancel.clone()) {
+    match answer_online(&request, &cache, saved.as_ref().map(|hit| hit.id.as_str()), events, cancel.clone()) {
         Ok((entry, notes)) => Ok(QaAnswer::from_entry(&question, entry, false, notes)),
         Err(error) if saved.is_some() && !cancel.load(Ordering::Relaxed) => {
             let hit = saved.expect("checked");

@@ -48,6 +48,10 @@ fn safe_component(part: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+fn saved_mode(meta: &Value) -> Option<u32> {
+    meta["mode"].as_u64().and_then(|n| u32::try_from(n).ok()).map(|mode| mode & 0o777)
+}
+
 impl ToolEngine {
     /// Saved versions of files in this project, newest first.
     pub fn checkpoints(&self) -> Result<CheckpointList> {
@@ -90,7 +94,8 @@ impl ToolEngine {
                 let when = saved_meta.modified().unwrap_or(UNIX_EPOCH);
                 let state = match self.state(relative) {
                     Ok(now) if now.kind == "missing" => CheckpointState::Missing,
-                    Ok(now) if now.sha256 == meta["sha256"].as_str().map(str::to_owned) => {
+                    Ok(now) if now.sha256 == meta["sha256"].as_str().map(str::to_owned)
+                        && saved_mode(&meta).is_none_or(|m| now.mode == Some(m)) => {
                         CheckpointState::SameAsSaved
                     }
                     Ok(_) => CheckpointState::ChangedSince,
@@ -168,12 +173,13 @@ impl ToolEngine {
                 "workspace": self.root(),
                 "relative_path": relative,
                 "sha256": hash(&current),
+                "mode": now.mode,
                 "backup_file": new_dir.join(format!("{new_key}.bak")),
             }))?)?;
             record.sync_all()?;
             safety_copy = json!(format!("{new_action}/{new_key}"));
         }
-        self.write_atomic(&relative, &bytes)?;
+        self.write_atomic_with_mode(&relative, &bytes, saved_mode(&meta))?;
         Ok(json!({
             "ok": true,
             "path": relative,
@@ -249,6 +255,29 @@ mod tests {
             e.checkpoints().unwrap().checkpoints[0].state,
             CheckpointState::SameAsSaved
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_script_restores_its_mode_and_legacy_checkpoints_still_work() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        let path = dir.path().join("run.sh");
+        fs::write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o751)).unwrap();
+        approve(&e, "delete_file", json!({"path":"run.sh"}));
+        let id = e.checkpoints().unwrap().checkpoints.remove(0).id;
+        e.restore_checkpoint(&id).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o751);
+        fs::remove_file(&path).unwrap();
+        let record = backups.path().join(&id).with_extension("json");
+        let mut metadata: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        metadata.as_object_mut().unwrap().remove("mode");
+        fs::write(record, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        e.restore_checkpoint(&id).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0);
     }
 
     #[test]
