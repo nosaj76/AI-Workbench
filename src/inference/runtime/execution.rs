@@ -2173,5 +2173,4 @@ pub(super) async fn run_chat(
 }
 
 #[cfg(test)]
-#[path = "execution_tests.rs"]
 mod tests;

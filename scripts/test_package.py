@@ -394,7 +394,8 @@ class SourceIntegrity(unittest.TestCase):
         self.assertEqual(theme.count('Stroke::new(1.0_f32,'), 2)
 
     def test_rc7_tool_recovery_sources_are_packaged(self):
-        runtime = (ROOT / 'src/inference/runtime/execution.rs').read_text()
+        # The turn loop's helpers live beside it since the execution.rs split.
+        runtime = (ROOT / 'src/inference/runtime/execution.rs').read_text() + (ROOT / 'src/inference/runtime/turn_helpers.rs').read_text() + (ROOT / 'src/inference/runtime/execution/tests.rs').read_text()
         routing = (ROOT / 'src/inference/routing.rs').read_text()
         protocol = (ROOT / 'src/inference/runtime/tool_protocol.rs').read_text()
         self.assertIn('route_for_task_excluding', runtime)
@@ -429,7 +430,8 @@ class SourceIntegrity(unittest.TestCase):
         tools = (ROOT / 'src/workspace/tools/mod.rs').read_text()
         preparation = (ROOT / 'src/workspace/tools/preparation.rs').read_text()
         execution = (ROOT / 'src/workspace/tools/execution.rs').read_text()
-        runtime = (ROOT / 'src/inference/runtime/execution.rs').read_text()
+        # The turn loop's helpers live beside it since the execution.rs split.
+        runtime = (ROOT / 'src/inference/runtime/execution.rs').read_text() + (ROOT / 'src/inference/runtime/turn_helpers.rs').read_text() + (ROOT / 'src/inference/runtime/execution/tests.rs').read_text()
         configuration = (ROOT / 'src/inference/runtime/configuration.rs').read_text()
         diagnostics = (ROOT / 'src/core/diagnostics.rs').read_text()
         preferences = (ROOT / 'src/desktop/app/preferences.rs').read_text()

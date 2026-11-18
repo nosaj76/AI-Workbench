@@ -295,6 +295,8 @@ mod terminal_guidance_tests {
         if settings.agents_enabled {
             definitions.push(delegation_tool_definition());
         }
+        // As in production: only the tool groups this turn needs are sent.
+        scope_tools_to_turn(&mut definitions, user, false);
         let history = vec![
             message("system", settings.system_prompt.clone()),
             message(

@@ -2255,5 +2255,7 @@ pub fn capture_research(
 }
 
 #[cfg(test)]
-#[path = "notes_tests.rs"]
+// notes.rs is loaded through a #[path] in lib.rs, so child paths resolve from
+// orchestration/; this keeps the conventional notes/tests.rs location.
+#[path = "notes/tests.rs"]
 mod tests;
