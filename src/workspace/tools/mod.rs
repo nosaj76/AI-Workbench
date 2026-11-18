@@ -48,6 +48,10 @@ pub enum ApprovalKind {
     FileChange,
     /// Runs a program inside the command sandbox.
     Command,
+    /// Fetches from this computer or the local network (loopback, LAN, link-local
+    /// metadata). Always asks: a web page cannot steer the model into local
+    /// services without the user seeing the address.
+    LocalNetwork,
     /// Runs a program or contacts an external service with the user's own
     /// permissions: unsandboxed commands and terminals, MCP calls, adapters
     /// and external agents. Automatic approval of sandboxed commands never
@@ -58,6 +62,7 @@ pub enum ApprovalKind {
 impl Operation {
     pub fn approval_kind(&self) -> ApprovalKind {
         match self {
+            Operation::FetchUrl { local: true, .. } => ApprovalKind::LocalNetwork,
             Operation::FetchUrl { .. }
             | Operation::WebSearch { .. }
             | Operation::McpWebSearch { .. }
@@ -164,6 +169,9 @@ pub enum Operation {
     FetchUrl {
         url: String,
         max_chars: usize,
+        /// The approved destination is loopback, LAN or another private address.
+        /// A fetch approved as public may only connect to public addresses.
+        local: bool,
     },
     WebSearch {
         query: String,
@@ -2110,6 +2118,37 @@ mod tests {
             "inside\n"
         );
         assert!(!outside.path().join("x").exists());
+    }
+
+    #[test]
+    fn local_fetches_always_ask_and_public_ones_stay_public() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_network_enabled(true);
+        for url in [
+            "http://127.0.0.1:11434/api/tags",
+            "http://localhost/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/",
+        ] {
+            let a = approval(e.prepare("fetch_url", &json!({"url":url})).unwrap());
+            assert_eq!(
+                a.operation.approval_kind(),
+                ApprovalKind::LocalNetwork,
+                "{url}"
+            );
+            assert_eq!(a.details["destination"], "local");
+        }
+        let a = approval(
+            e.prepare("fetch_url", &json!({"url":"https://1.1.1.1/"}))
+                .unwrap(),
+        );
+        assert_eq!(a.operation.approval_kind(), ApprovalKind::Web);
+        assert!(matches!(
+            a.operation,
+            Operation::FetchUrl { local: false, .. }
+        ));
     }
 
     #[test]

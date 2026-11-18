@@ -133,6 +133,9 @@ impl Workbench {
                 "Bubblewrap is not available, so Auto runs commands unsandboxed and Required refuses them. Install it with: sudo apt install bubblewrap"
             });
             ui.checkbox(&mut draft.sandbox_network, "Allow network access inside the sandbox");
+            if draft.sandbox_network {
+                ui.small("This includes services on this computer and your LAN, such as Ollama's API on 127.0.0.1:11434, which can delete or download models.");
+            }
             ui.label("Folders the sandbox may read (one per line, ~/ allowed)");
             ui.add(egui::TextEdit::multiline(&mut draft.sandbox_read_only_paths).desired_rows(3).desired_width(f32::INFINITY));
             let sandboxed = draft.command_sandbox != "off" && sandbox_ready;

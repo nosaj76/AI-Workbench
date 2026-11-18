@@ -238,6 +238,7 @@ impl Workbench {
                         crate::tools::ApprovalKind::UnsandboxedCommand => {
                             self.settings.auto_approve_unsandboxed
                         }
+                        crate::tools::ApprovalKind::LocalNetwork => false,
                     };
                     if automatic {
                         let _ = self.store.audit(
