@@ -22,6 +22,8 @@ pub mod document_activities;
 #[path = "workspace/confined.rs"]
 pub mod confined;
 
+#[path = "workspace/diff.rs"]
+pub mod diff;
 #[path = "workspace/files.rs"]
 pub mod files;
 
@@ -122,6 +124,9 @@ pub mod jobs;
 
 #[path = "desktop/theme.rs"]
 pub mod theme;
+
+#[path = "desktop/action_preview.rs"]
+pub mod action_preview;
 
 #[path = "core/diagnostics.rs"]
 pub mod diagnostics;

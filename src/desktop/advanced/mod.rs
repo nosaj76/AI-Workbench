@@ -392,12 +392,7 @@ impl AdvancedUi {
                     ui.heading(&a.action.title);
                     ui.label(&a.action.description);
                     egui::ScrollArea::both().max_height(410.0).show(ui, |ui| {
-                        ui.label(
-                            RichText::new(
-                                serde_json::to_string_pretty(&a.action.details).unwrap_or_default(),
-                            )
-                            .monospace(),
-                        );
+                        crate::action_preview::show_action_details(ui, &a.action.details);
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Deny").clicked() {
