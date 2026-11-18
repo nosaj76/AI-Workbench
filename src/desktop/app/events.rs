@@ -23,6 +23,9 @@ impl Workbench {
     }
 
     pub(super) fn refresh_models(&mut self) {
+        if self.demo {
+            return;
+        }
         self.connection_request_id = self.connection_request_id.wrapping_add(1);
         self.version.clear();
         self.models.clear();
@@ -431,6 +434,8 @@ impl Workbench {
                     }
                 }
                 WorkEvent::Preview {
+                    source_text,
+                    truncated,
                     request_id,
                     root,
                     path,
@@ -444,6 +449,8 @@ impl Workbench {
                         self.preview_original = text.clone();
                         self.preview = text;
                         self.preview_note = note;
+                        self.preview_source_text = source_text;
+                        self.preview_truncated = truncated;
                     }
                 }
                 WorkEvent::Attached(items) => {

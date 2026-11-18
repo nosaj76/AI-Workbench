@@ -11,7 +11,15 @@ impl ToolEngine {
                 }
                 if meta.is_file() {
                     let bytes = read_limited_beneath(self.root(), &resolved, MAX_FILE_BYTES)?;
+                    #[cfg(unix)]
+                    let mode = {
+                        use std::os::unix::fs::PermissionsExt;
+                        Some(meta.permissions().mode() & 0o777)
+                    };
+                    #[cfg(not(unix))]
+                    let mode = None;
                     Ok(PathState {
+                        mode,
                         path: path.into(),
                         resolved,
                         kind: "file".into(),
@@ -20,6 +28,7 @@ impl ToolEngine {
                     })
                 } else if meta.is_dir() {
                     Ok(PathState {
+                        mode: None,
                         path: path.into(),
                         resolved,
                         kind: "directory".into(),
@@ -31,6 +40,7 @@ impl ToolEngine {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PathState {
+                mode: None,
                 path: path.into(),
                 resolved,
                 kind: "missing".into(),
@@ -73,7 +83,7 @@ impl ToolEngine {
         file.sync_all()?;
         let metadata = directory.join(format!("{}.json", &key[..20]));
         let mut meta = private_create(&metadata)?;
-        meta.write_all(&serde_json::to_vec_pretty(&json!({"action_id":action.id,"original_path":state.resolved,"workspace":action.workspace,"relative_path":path,"sha256":state.sha256,"backup_file":destination}))?)?;
+        meta.write_all(&serde_json::to_vec_pretty(&json!({"action_id":action.id,"original_path":state.resolved,"workspace":action.workspace,"relative_path":path,"sha256":state.sha256,"mode":state.mode,"backup_file":destination}))?)?;
         meta.sync_all()?;
         Ok(Some(destination))
     }
@@ -103,6 +113,10 @@ impl ToolEngine {
     }
 
     pub(super) fn write_atomic(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        self.write_atomic_with_mode(path, bytes, None)
+    }
+
+    pub(super) fn write_atomic_with_mode(&self, path: &str, bytes: &[u8], saved_mode: Option<u32>) -> Result<()> {
         let target = self.workspace.resolve(path, true)?;
         let parent = target.parent().context("File has no parent")?;
         self.create_dir_confined(parent)?;
@@ -122,13 +136,21 @@ impl ToolEngine {
             };
             #[cfg(not(unix))]
             let mode = None;
-            if crate::confined::write_atomic(self.root(), relative, bytes, mode)?.is_some() {
+            if crate::confined::write_atomic(self.root(), relative, bytes, saved_mode.or(mode))?.is_some() {
                 return Ok(());
             }
         }
         let temp = parent.join(format!(".workbench-{}.tmp", uuid::Uuid::new_v4()));
         let result = (|| -> Result<()> {
             let mut file = private_create(&temp)?;
+            #[cfg(unix)]
+            if let Some(mode) = saved_mode {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+            } else if let Ok(metadata) = fs::metadata(&target) {
+                file.set_permissions(metadata.permissions())?;
+            }
+            #[cfg(not(unix))]
             if let Ok(metadata) = fs::metadata(&target) {
                 file.set_permissions(metadata.permissions())?;
             }

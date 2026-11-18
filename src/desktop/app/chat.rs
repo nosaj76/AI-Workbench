@@ -61,6 +61,9 @@ impl Workbench {
     }
 
     pub(super) fn launch_chat(&mut self, messages: Vec<ChatMessage>, model: String) {
+        if self.demo {
+            return;
+        }
         self.cancel = Arc::new(AtomicBool::new(false));
         self.busy = true;
         self.error = None;
@@ -117,7 +120,7 @@ impl Workbench {
     }
 
     pub(super) fn regenerate(&mut self) {
-        if self.busy || self.work_busy || self.approval.is_some() {
+        if self.demo || self.busy || self.work_busy || self.approval.is_some() {
             return;
         }
         if let Some(index) = self
@@ -452,7 +455,7 @@ impl Workbench {
                 }
                 if ui
                     .add_enabled(
-                        !self.busy && !self.session.entries.is_empty(),
+                        !self.demo && !self.busy && !self.session.entries.is_empty(),
                         egui::Button::new("Regenerate response"),
                     )
                     .clicked()
