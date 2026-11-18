@@ -1168,3 +1168,25 @@ fn demo_model_actions_never_start_a_worker_or_contact_ollama() {
     assert_eq!(app.session.id, original);
     assert_eq!(mock.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 }
+
+#[test]
+fn importing_a_stored_conversation_keeps_both_copies() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.session.title = "Original".into();
+    app.persist();
+    let original_id = app.session.id.clone();
+    let imported = Session {
+        id: original_id.clone(),
+        title: "Imported".into(),
+        ..Default::default()
+    };
+    app.work_tx.send(WorkEvent::Import(imported)).unwrap();
+    app.receive_events();
+    assert!(app.error.is_none(), "{:?}", app.error);
+    assert_ne!(app.session.id, original_id);
+    let other = Store::open(dir.path()).unwrap();
+    assert_eq!(other.load(&original_id).unwrap().title, "Original");
+    assert_eq!(other.load(&app.session.id).unwrap().title, "Imported");
+}

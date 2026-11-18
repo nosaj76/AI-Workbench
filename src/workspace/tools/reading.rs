@@ -305,7 +305,9 @@ impl ToolEngine {
         if resume_after.is_some() && resuming {
             bail!("resume_after path was not found while walking; pass the exact `resume_after` value from the previous result");
         }
-        let complete = stopped_for.is_none() && partly_read_count == 0 && skipped_unreadable == 0;
+        // Unreadable or partly extracted files are reported below; they cannot be
+        // fixed by repeating the search, so they must not keep it incomplete forever.
+        let complete = stopped_for.is_none();
         let coverage = if complete {
             let mut note = format!("COMPLETE: every searchable text file under `{path}` was searched ({files} files read). ");
             note.push_str(if matches.is_empty() {
@@ -316,11 +318,15 @@ impl ToolEngine {
             if needs_extractor_count > 0 {
                 note.push_str(&format!(" {needs_extractor_count} file(s) (PDF/scanned/image types) were NOT searched because they need an external extractor; read them with read_file."));
             }
+            if partly_read_count > 0 {
+                note.push_str(&format!(" {partly_read_count} file(s) were only searched in part (see partly_read_files)."));
+            }
+            if skipped_unreadable > 0 {
+                note.push_str(&format!(" {skipped_unreadable} file(s) could not be read as UTF-8 text and were skipped (see files_skipped)."));
+            }
             note
         } else if let Some(line) = next_line {
             format!("INCOMPLETE: continue the same query with resume_after={:?} and resume_line={line}.", last_path.as_deref().unwrap_or_default())
-        } else if stopped_for.is_none() {
-            format!("INCOMPLETE: {partly_read_count} partially extracted and {skipped_unreadable} unreadable file(s). Inspect the original files or export them as UTF-8 text before repeating the search.")
         } else {
             let reason = if stopped_for == Some("match_limit") {
                 "the match limit was reached"
