@@ -83,7 +83,9 @@ impl Workbench {
             }
             let mut copy = self.session.clone();
             copy.id = uuid::Uuid::new_v4().to_string();
-            copy.title = format!("{} · recovered edits", copy.title);
+            if !copy.title.ends_with(" · recovered edits") {
+                copy.title = format!("{} · recovered edits", copy.title);
+            }
             if let Err(error) = self.store.save(&mut copy) {
                 self.error = Some(format!("Save recovered conversation: {error:#}"));
                 return;

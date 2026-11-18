@@ -288,17 +288,39 @@ impl ToolEngine {
         } else {
             // A path-limited commit already takes tracked content from the worktree.
             // Register new paths, skipping deletions that may already be staged.
-            let mut add = vec!["add", "--intent-to-add", "--"];
+            let mut existing = Vec::new();
             for path in paths {
                 if self.workspace.resolve(path, true)?.try_exists()? {
-                    add.push(path.as_str());
+                    existing.push(path.as_str());
                 }
             }
-            if add.len() > 3 {
+            let mut registered = Vec::new();
+            if !existing.is_empty() {
+                let indexed = |engine: &Self| -> Result<std::collections::BTreeSet<String>> {
+                    let mut args = vec!["ls-files", "--cached", "-z", "--"];
+                    args.extend(&existing);
+                    let out = engine.git_ok(&args, true)?;
+                    Ok(out.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect())
+                };
+                let before = indexed(self)?;
+                let mut add = vec!["add", "--intent-to-add", "--"];
+                add.extend(&existing);
                 self.git_ok(&add, false)?;
+                registered = indexed(self)?.difference(&before).cloned().collect();
             }
             commit.extend(["--only", "--"]);
             commit.extend(paths.iter().map(String::as_str));
+            if let Err(error) = self.git_ok(&commit, false) {
+                // Leave the index as it was: drop the intent-to-add entries made above.
+                if !registered.is_empty() {
+                    let mut undo = vec!["rm", "--cached", "--quiet", "--"];
+                    undo.extend(registered.iter().map(String::as_str));
+                    let _ = self.git_ok(&undo, false);
+                }
+                return Err(error);
+            }
+            let commit = self.git_ok(&["log", "-1", "--format=%h %s"], true)?;
+            return Ok(json!({"ok": true, "commit": commit.trim(), "branch": branch}));
         }
         self.git_ok(&commit, false)?;
         let commit = self.git_ok(&["log", "-1", "--format=%h %s"], true)?;
@@ -359,6 +381,16 @@ mod tests {
         engine.approve(&action).unwrap();
         assert_eq!(engine.git_ok(&["diff", "--name-only", "HEAD^", "HEAD"], true).unwrap().trim(), "a.txt\nselected");
         assert_eq!(engine.git_ok(&["diff", "--cached", "--name-only"], true).unwrap().trim(), "unrelated");
+    }
+
+    #[test]
+    fn a_failed_selected_commit_leaves_no_intent_to_add_entries() {
+        let (dir, _backups, engine) = repo();
+        std::fs::write(dir.path().join("new.txt"), "new file").unwrap();
+        let paths = vec!["new.txt".to_string(), "never-existed.txt".to_string()];
+        assert!(engine.execute_git_commit("fails", &paths, None).is_err());
+        assert_eq!(engine.git_ok(&["ls-files", "--cached", "--", "new.txt"], true).unwrap(), "");
+        assert!(dir.path().join("new.txt").exists());
     }
 
     #[test]

@@ -1190,3 +1190,25 @@ fn importing_a_stored_conversation_keeps_both_copies() {
     assert_eq!(other.load(&original_id).unwrap().title, "Original");
     assert_eq!(other.load(&app.session.id).unwrap().title, "Imported");
 }
+
+#[test]
+fn repeated_conflicts_do_not_stack_the_recovered_suffix() {
+    let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.session.title = "Notes".into();
+    app.persist();
+    let other = Store::open(dir.path()).unwrap();
+    for round in 0..2 {
+        let mut newer = other.load(&app.session.id).unwrap();
+        newer.title = format!("Other window {round}");
+        other.save(&mut newer).unwrap();
+        app.session.entries.push(Entry::new(ChatMessage {
+            role: "user".into(),
+            content: format!("edit {round}"),
+            ..Default::default()
+        }));
+        app.persist();
+    }
+    assert_eq!(app.session.title, "Notes · recovered edits");
+}
