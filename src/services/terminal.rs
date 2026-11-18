@@ -34,6 +34,9 @@ pub struct TerminalConfig {
     /// Run the session inside bubblewrap (terminals the model opens).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<crate::sandbox::SandboxPolicy>,
+    /// The model may list, read and (with approval) type into this session.
+    /// Only terminals the model opened, or ones the user shares, have it.
+    pub ai_access: bool,
 }
 
 impl Default for TerminalConfig {
@@ -47,6 +50,7 @@ impl Default for TerminalConfig {
             rows: 28,
             cols: 100,
             sandbox: None,
+            ai_access: false,
         }
     }
 }
@@ -90,6 +94,9 @@ pub struct TerminalSummary {
     /// The session runs inside the bubblewrap sandbox.
     #[serde(default)]
     pub sandboxed: bool,
+    /// The model may use this session (it opened it, or the user shared it).
+    #[serde(default)]
+    pub ai_access: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +251,7 @@ struct TerminalSession {
     output_closed: Arc<AtomicBool>,
     exit_code: Mutex<Option<i32>>,
     sandboxed: bool,
+    ai_access: AtomicBool,
 }
 
 #[derive(Default)]
@@ -411,6 +419,7 @@ impl TerminalManager {
             output_closed: output_closed.clone(),
             exit_code: Mutex::new(None),
             sandboxed,
+            ai_access: AtomicBool::new(config.ai_access),
         });
         let output_state = state.clone();
         let output_stop = stop.clone();
@@ -486,6 +495,28 @@ impl TerminalManager {
 
     pub fn summary(&self, id: &str) -> Result<TerminalSummary> {
         self.session(id)?.summary()
+    }
+
+    /// Sessions the model may use: the ones it opened and the ones the user shared.
+    pub fn ai_list(&self) -> Vec<TerminalSummary> {
+        self.list().into_iter().filter(|s| s.ai_access).collect()
+    }
+
+    /// The summary of a session the model may use; any other session is refused
+    /// with the same message as an unknown id, so its existence is not revealed.
+    pub fn ai_summary(&self, id: &str) -> Result<TerminalSummary> {
+        match self.summary(id) {
+            Ok(summary) if summary.ai_access => Ok(summary),
+            _ => bail!("No terminal session {id:?} is available to the AI. Terminals the user opens are private unless shared; use terminal_list, or terminal_open to start one."),
+        }
+    }
+
+    /// Share a user-opened session with the model, or make it private again.
+    pub fn set_ai_access(&self, id: &str, allowed: bool) -> Result<()> {
+        self.session(id)?
+            .ai_access
+            .store(allowed, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn bytes_received(&self, id: &str) -> Result<u64> {
@@ -914,6 +945,7 @@ impl TerminalSession {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Terminal process unavailable"))?,
             sandboxed: self.sandboxed,
+            ai_access: self.ai_access.load(Ordering::Relaxed),
         })
     }
     fn terminate(&self) {

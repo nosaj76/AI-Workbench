@@ -46,8 +46,13 @@ pub enum ApprovalKind {
     Web,
     /// Changes files in the project (backed up and checked afterwards).
     FileChange,
-    /// Runs a program or contacts an external service with the user's permissions.
+    /// Runs a program inside the command sandbox.
     Command,
+    /// Runs a program or contacts an external service with the user's own
+    /// permissions: unsandboxed commands and terminals, MCP calls, adapters
+    /// and external agents. Automatic approval of sandboxed commands never
+    /// covers these.
+    UnsandboxedCommand,
 }
 
 impl Operation {
@@ -65,16 +70,28 @@ impl Operation {
             | Operation::Move { .. }
             | Operation::Delete { .. }
             | Operation::MakeDirectory { .. } => ApprovalKind::FileChange,
+            Operation::Command { spec } if spec.sandbox.is_some() => ApprovalKind::Command,
+            Operation::TerminalOpen { config, .. } if config.sandbox.is_some() => {
+                ApprovalKind::Command
+            }
+            Operation::TerminalWrite { sandboxed, .. }
+            | Operation::TerminalKey { sandboxed, .. }
+                if *sandboxed =>
+            {
+                ApprovalKind::Command
+            }
+            // Resizing or closing a terminal the AI may use runs no new code.
+            Operation::TerminalResize { .. } | Operation::TerminalClose { .. } => {
+                ApprovalKind::Command
+            }
             Operation::Command { .. }
             | Operation::TerminalOpen { .. }
             | Operation::TerminalWrite { .. }
             | Operation::TerminalKey { .. }
-            | Operation::TerminalResize { .. }
-            | Operation::TerminalClose { .. }
             | Operation::McpConnect { .. }
             | Operation::McpCall { .. }
             | Operation::ExternalAgent { .. }
-            | Operation::Adapter { .. } => ApprovalKind::Command,
+            | Operation::Adapter { .. } => ApprovalKind::UnsandboxedCommand,
         }
     }
 }
@@ -126,12 +143,15 @@ pub enum Operation {
         enter: bool,
         wait_ms: u64,
         max_bytes: usize,
+        /// The session runs in the sandbox (fixed for a session's lifetime).
+        sandboxed: bool,
     },
     TerminalKey {
         session_id: String,
         key: String,
         wait_ms: u64,
         max_bytes: usize,
+        sandboxed: bool,
     },
     TerminalResize {
         session_id: String,
@@ -402,6 +422,15 @@ impl ToolEngine {
         if let Ok(mut current) = self.sandbox.lock() {
             *current = settings;
         }
+    }
+
+    pub(super) fn sandbox_is_off(&self) -> Result<bool> {
+        Ok(self
+            .sandbox
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sandbox settings lock failed"))?
+            .mode
+            == crate::sandbox::SandboxMode::Off)
     }
 
     /// The policy for the next model-proposed command or terminal, if any.
@@ -823,6 +852,7 @@ impl ToolEngine {
                 definition("delete_file", "Propose removing a local file after preserving a restorable copy. Does not recursively delete directories. User approval is required.", json!({"path":path()}), &["path"]),
                 definition("make_directory", "Propose creating a local directory and any missing parents. User approval is required.", json!({"path":path()}), &["path"]),
                 definition("run_command", "Propose a one-shot local executable and argument array. There is no implicit shell. For Bash sessions, interactive CLI programs, REPLs or modernbasic use terminal_open and terminal_write instead. This command requires approval; output and duration are bounded.", json!({"program":string(),"args":{"type":"array","items":string()},"cwd":path(),"stdin_text":string(),"timeout_secs":{"type":"integer","minimum":1,"maximum":3600},"max_output_bytes":{"type":"integer","minimum":1024,"maximum":2097152}}), &["program"]),
+                definition("run_python", "Run Python 3 code in the command sandbox (project folder writable, no network unless allowed). Requires approval; print results.", json!({"code":string(),"timeout_secs":{"type":"integer","minimum":1,"maximum":600}}), &["code"]),
             ]);
             tools.extend(terminal::definitions());
         }
@@ -2080,6 +2110,85 @@ mod tests {
             "inside\n"
         );
         assert!(!outside.path().join("x").exists());
+    }
+
+    #[test]
+    fn only_sandboxed_commands_count_as_sandboxed_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        // Sandbox off: commands and terminals have the user's permissions.
+        let a = approval(
+            e.prepare("run_command", &json!({"program":"true"}))
+                .unwrap(),
+        );
+        assert_eq!(
+            a.operation.approval_kind(),
+            ApprovalKind::UnsandboxedCommand
+        );
+        let a = approval(e.prepare("terminal_open", &json!({})).unwrap());
+        assert_eq!(
+            a.operation.approval_kind(),
+            ApprovalKind::UnsandboxedCommand
+        );
+        if crate::sandbox::available() {
+            e.set_sandbox(SandboxSettings::default());
+            for (name, args) in [
+                ("run_command", json!({"program":"true"})),
+                ("run_python", json!({"code":"print(1)"})),
+                ("terminal_open", json!({})),
+            ] {
+                let a = approval(e.prepare(name, &args).unwrap());
+                assert_eq!(a.operation.approval_kind(), ApprovalKind::Command, "{name}");
+            }
+        }
+        // Configured integrations always run outside the sandbox.
+        let adapter = Operation::Adapter {
+            adapter_id: "speech".into(),
+            spec: CommandSpec::default(),
+            output: None,
+            config_hash: String::new(),
+        };
+        assert_eq!(adapter.approval_kind(), ApprovalKind::UnsandboxedCommand);
+    }
+
+    #[test]
+    fn run_python_executes_in_the_sandbox_and_shows_the_code() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_sandbox(SandboxSettings::default());
+        let code = "import os, socket\nopen('result.txt','w').write(str(6*7))\nprint(sorted(os.listdir(os.environ['HOME'])))\ntry:\n    socket.create_connection(('1.1.1.1', 53), timeout=2); print('NET')\nexcept OSError:\n    print('NONET')";
+        let a = approval(e.prepare("run_python", &json!({"code":code})).unwrap());
+        assert_eq!(a.title, "Run Python code");
+        assert_eq!(a.details["code"], code);
+        assert_eq!(a.details["sandbox"]["sandboxed"], true);
+        let result = e.approve(&a).unwrap().to_string();
+        assert!(
+            result.contains("[]") && result.contains("NONET"),
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result.txt")).unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn run_python_refuses_to_run_unsandboxed_unless_the_sandbox_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        // Off: allowed, with the warning.
+        let a = approval(
+            e.prepare("run_python", &json!({"code":"print(1)"}))
+                .unwrap(),
+        );
+        assert!(a.description.contains("sandbox is off"));
+        assert!(e.prepare("run_python", &json!({"code":""})).is_err());
     }
 
     #[test]

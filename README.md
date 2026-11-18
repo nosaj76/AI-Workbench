@@ -82,7 +82,7 @@ invalid values are rejected without changing anything.
 | Section | What to set |
 | --- | --- |
 | **Connection and privacy** | Ollama URL (default `http://127.0.0.1:11434`). Remote or cloud model endpoints are blocked unless you allow them. Turn on web fetch and search tools here, and optionally a SearXNG URL, a text browser for search, and the local sites address. |
-| **Tools and command approvals** | Enable workspace tools (files, commands, terminals). Choose what may run without asking: web actions, file changes (always backed up and restorable), commands. Set the command sandbox (auto, required or off), its network access and the folders it may read. Everything else shows a preview to approve. |
+| **Tools and command approvals** | Enable workspace tools (files, commands, terminals). Choose what may run without asking: web actions, file changes made by file tools (backed up and restorable), sandboxed commands, and — separately — unsandboxed actions (commands without the sandbox, adapters, external agents, MCP calls). Set the command sandbox (auto, required or off), its network access and the folders it may read. Everything else shows a preview to approve. |
 | **Appearance** | Light/Dark theme and interface scale (`Ctrl+Shift+T` toggles the theme). |
 | **Generation and context** | Temperature, context size, output limit, thinking mode, tool rounds. Larger contexts need more memory. |
 | **Instructions, memory and agents** | System instruction, your own standing preferences, automatic memory, and supervised subagents. |
@@ -123,13 +123,27 @@ Commands and terminals the assistant opens run in a
 - they see an empty home folder, except read-only tool folders you list
   (by default `~/.cargo/bin`, `~/.rustup`, `~/.local/bin`);
 - they have no network unless you allow it, and a cleared environment, so API
-  keys in your environment are not passed in.
+  keys in your environment are not passed in;
+- the project's `.git` folder is read-only (so hooks and git config cannot be
+  planted to run outside the sandbox later), and secret files in the project
+  (`.env`, `*.pem`, `*.key`, `secrets/`, `credentials.json` and the other names
+  file tools refuse) appear empty. Installed packages such as Python
+  `site-packages` are left alone.
 
 **Auto** (the default) sandboxes whenever bubblewrap is installed and runs
 commands unsandboxed otherwise, saying so in the approval preview. **Required**
 refuses to run commands without the sandbox. **Off** runs them with your normal
 permissions. Terminals you open yourself, and adapters, MCP servers and external
 agents you configure, are not sandboxed. `setup.sh` installs bubblewrap.
+
+Terminals you open yourself are private: the assistant cannot list, read or
+type into them unless you tick **AI may use** for that terminal in the
+Terminals panel. It can always use the terminals it opened.
+
+The assistant can also propose a Python 3 snippet (`run_python`) for
+calculations or checking project files; the approval preview shows the code.
+It runs only in the sandbox: if bubblewrap is missing it is refused (even in
+Auto), unless the sandbox is set to Off.
 
 ### Data, backups and crash reports
 

@@ -690,15 +690,17 @@ fn denied_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     matches!(
         n.as_str(),
-        ".git"
-            | ".svn"
-            | ".hg"
-            | "target"
-            | "node_modules"
-            | "__pycache__"
-            | ".venv"
-            | "venv"
-            | ".ssh"
+        ".git" | ".svn" | ".hg" | "target" | "node_modules" | "__pycache__" | ".venv" | "venv"
+    ) || secret_name(name)
+}
+
+/// Names of credentials and private data. File tools refuse them, and the
+/// command sandbox hides them inside the project folder.
+pub fn secret_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        ".ssh"
             | ".aws"
             | ".gnupg"
             | ".ollama-workbench"

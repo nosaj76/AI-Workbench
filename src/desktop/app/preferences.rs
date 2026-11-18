@@ -105,7 +105,11 @@ impl Workbench {
             );
             ui.checkbox(
                 &mut draft.auto_approve_commands,
-                "Commands and interactive terminals, adapters, external agents and MCP calls",
+                "Sandboxed commands and terminals (run inside the command sandbox)",
+            );
+            ui.checkbox(
+                &mut draft.auto_approve_unsandboxed,
+                "Unsandboxed actions: commands and terminals without the sandbox, adapters, external agents and MCP calls",
             );
             ui.small("Includes opening Bash and sending text or keys to programs such as modernbasic. Reading an existing terminal needs no command approval. Chat Stop ends AI interaction; the terminal stays open until you close it.");
             ui.horizontal(|ui| {
@@ -132,13 +136,14 @@ impl Workbench {
             ui.label("Folders the sandbox may read (one per line, ~/ allowed)");
             ui.add(egui::TextEdit::multiline(&mut draft.sandbox_read_only_paths).desired_rows(3).desired_width(f32::INFINITY));
             let sandboxed = draft.command_sandbox != "off" && sandbox_ready;
-            if draft.auto_approve_commands && !sandboxed {
+            if draft.auto_approve_unsandboxed {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 90, 40),
-                    "Commands run with your user permissions and are not sandboxed. The model can run anything your account can.",
+                    "Unsandboxed actions run with your user permissions without asking. The model can run anything your account can.",
                 );
-            } else if draft.auto_approve_commands {
-                ui.small("Approved commands still run inside the sandbox. Adapters, external agents and MCP servers you configured run outside it.");
+            }
+            if draft.auto_approve_commands && !sandboxed {
+                ui.small("With the sandbox unavailable or off, commands are unsandboxed and keep asking unless the unsandboxed option is also on.");
             }
             ui.small("Every automatic approval is still recorded in the action log. Background jobs and subagents keep asking or denying as before.");
             ui.separator();

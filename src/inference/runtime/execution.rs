@@ -2520,9 +2520,9 @@ fn repeat_scope(name: &str) -> RepeatScope {
         | "list_adapters"
         | "list_external_agents" => RepeatScope::Observation,
         "write_file" | "replace_text" | "edit_file" | "copy_file" | "move_file" | "delete_file"
-        | "make_directory" | "mkdir" | "run_command" | "mcp_connect" | "mcp_call"
-        | "consult_agent" | "run_adapter" | "terminal_open" | "terminal_write" | "terminal_key"
-        | "terminal_resize" | "terminal_close" => RepeatScope::StateChanging,
+        | "make_directory" | "mkdir" | "run_command" | "run_python" | "mcp_connect"
+        | "mcp_call" | "consult_agent" | "run_adapter" | "terminal_open" | "terminal_write"
+        | "terminal_key" | "terminal_resize" | "terminal_close" => RepeatScope::StateChanging,
         _ => RepeatScope::Persistent,
     }
 }
