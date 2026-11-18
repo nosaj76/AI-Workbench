@@ -415,15 +415,27 @@ fn live_chat_uses_qa_lookup_and_its_cache() {
     assert!(first.answer.contains("git branch -m"), "{}", first.answer);
 
     let second = run_live(settings, None, data.path(), prompt);
-    let cached = second
+    // The repeated question must not go online again. It may be answered from
+    // the Q&A library (a cached lookup) or from the knowledge note built from
+    // the first lookup's sources.
+    let online_again = second
         .tools
         .iter()
         .filter(|(n, _)| n == "qa_lookup")
-        .any(|(_, c)| c.contains("\"cached\":true"));
+        .any(|(_, c)| c.contains("\"cached\":false"));
+    let cached = second
+        .tools
+        .iter()
+        .any(|(n, c)| n == "qa_lookup" && c.contains("\"cached\":true"));
+    let from_note = second
+        .statuses
+        .iter()
+        .any(|s| s.starts_with("Using ") && s.contains("saved knowledge note"));
     assert!(
-        cached,
-        "the repeated question was looked up online again: {:?}",
-        second.tools
+        !online_again && (cached || from_note),
+        "the repeated question was looked up online again: {:?} {:?}",
+        second.tools,
+        second.statuses
     );
     assert!(
         second.approvals.iter().all(|a| !a.contains("Q&A")),
@@ -433,20 +445,22 @@ fn live_chat_uses_qa_lookup_and_its_cache() {
 }
 
 #[test]
-#[ignore = "needs a local Ollama server and a real model"]
+#[ignore = "needs a local Ollama server, a web search provider and internet access"]
 fn live_knowledge_notes_are_built_from_a_chat_and_recalled_in_the_next() {
     let data = tempfile::tempdir().unwrap();
     let mut settings = live_settings();
     settings.knowledge_notes = true;
     settings.automatic_memory = false;
-    settings.network_tools = false;
+    // Notes keep facts taken from real pages; a model's own answer is never
+    // saved (see answers_from_the_model_alone_are_never_saved_as_notes).
+    settings.network_tools = true;
     settings.retrieval_enabled = false;
     settings.num_predict = 1500;
     let first = run_live(
         settings.clone(),
         None,
         data.path(),
-        "Explain how the Rust borrow checker prevents data races, including ownership, shared and mutable references, and the Send and Sync traits.",
+        "Search the web: how does the Rust borrow checker prevent data races, including ownership, shared and mutable references, and the Send and Sync traits?",
     );
     assert!(first.errors.is_empty(), "{:?}", first.errors);
     let store = ollama_workbench::notes::NoteStore::open(data.path()).unwrap();
@@ -464,10 +478,12 @@ fn live_knowledge_notes_are_built_from_a_chat_and_recalled_in_the_next() {
             note.title,
             std::fs::read_to_string(store.path(&summary.slug)).unwrap()
         );
-        assert!(note
-            .entries
-            .iter()
-            .all(|e| e.basis == "model answer, unverified"));
+        assert!(
+            note.entries
+                .iter()
+                .all(|e| e.basis == ollama_workbench::notes::BASIS_WEB && !e.sources.is_empty()),
+            "every saved fact must come from a cited web page"
+        );
     }
     let second = run_live(
         settings,
