@@ -123,9 +123,12 @@ Commands and terminals the assistant opens run in a
 - they see an empty home folder, except read-only tool folders you list
   (by default `~/.cargo/bin`, `~/.rustup`, `~/.local/bin`);
 - they have no network unless you allow it, and a cleared environment, so API
-  keys in your environment are not passed in. Allowing network also reaches
-  services on this computer and your LAN (for example Ollama on
-  `127.0.0.1:11434`);
+  keys in your environment are not passed in. With
+  [passt](https://passt.top) installed (`setup.sh` installs it), allowed
+  network means the internet only: the sandbox gets its own network stack, and
+  this computer's services (such as Ollama on `127.0.0.1:11434`), Docker
+  bridges and the LAN are blocked. Without passt, allowed network also reaches
+  those local services;
 - the project's `.git` folder is read-only (so hooks and git config cannot be
   planted to run outside the sandbox later), and secret files in the project
   (`.env`, `*.pem`, `*.key`, `secrets/`, `credentials.json` and the other names

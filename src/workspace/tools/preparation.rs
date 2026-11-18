@@ -332,7 +332,7 @@ impl ToolEngine {
                 let details = command_preview(&spec);
                 expected.push(state);
                 let description = match &spec.sandbox {
-                    Some(policy) => format!("Runs in a sandbox: it can change files only in the project folder, cannot see your home folder{}. Only the exact executable and arguments shown are approved.", if policy.network { ", and may use the network, including services on this computer such as Ollama" } else { ", and has no network" }),
+                    Some(policy) => format!("Runs in a sandbox: it can change files only in the project folder, cannot see your home folder{}. Only the exact executable and arguments shown are approved.", if policy.network { format!(", and has network access: {}", policy.network_access()) } else { ", and has no network".into() }),
                     None => "This command is not sandboxed. It can read, change files, or use the network with your OS permissions. Only the exact executable and arguments shown are approved.".into(),
                 };
                 (
@@ -373,7 +373,7 @@ impl ToolEngine {
                 details["language"] = json!("python");
                 expected.push(state);
                 let description = match &spec.sandbox {
-                    Some(policy) => format!("Run this Python code in the sandbox: it can change files only in the project folder{}.", if policy.network { " and may use the network, including services on this computer such as Ollama" } else { " and has no network" }),
+                    Some(policy) => format!("Run this Python code in the sandbox: it can change files only in the project folder{}.", if policy.network { format!(" and has network access: {}", policy.network_access()) } else { " and has no network".into() }),
                     None => "The command sandbox is off: this Python code runs with your OS permissions.".into(),
                 };
                 (

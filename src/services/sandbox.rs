@@ -97,6 +97,15 @@ impl SandboxPolicy {
             out.push("--new-session".into());
         }
         out.push("--unshare-all".into());
+        if self.network && net_isolation().is_some() {
+            // pasta's namespace runs the setup as uid 0; give the sandboxed
+            // program the user's own ids again, as without isolation.
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            push(
+                &mut out,
+                ["--uid", &uid.to_string(), "--gid", &gid.to_string()],
+            );
+        }
         if self.network {
             out.push("--share-net".into());
         }
@@ -117,7 +126,13 @@ impl SandboxPolicy {
         }
         push(&mut out, ["--ro-bind", "/etc", "/etc"]);
         push(&mut out, ["--ro-bind-try", "/opt", "/opt"]);
-        if self.network {
+        let isolation = if self.network { net_isolation() } else { None };
+        if let Some(isolation) = isolation {
+            // Public resolvers only, at the path /etc/resolv.conf resolves to.
+            let file = isolation.resolv_file.to_string_lossy();
+            let target = isolation.resolv_target.to_string_lossy();
+            push(&mut out, ["--ro-bind", &file, &target]);
+        } else if self.network {
             // Ubuntu's resolv.conf points into /run for DNS.
             push(
                 &mut out,
@@ -169,7 +184,36 @@ impl SandboxPolicy {
         out.push("--".into());
         out.push(program.into());
         out.extend(args.iter().cloned());
-        Ok((bwrap.to_string_lossy().into_owned(), out))
+        let bwrap = bwrap.to_string_lossy().into_owned();
+        if let Some(isolation) = isolation {
+            // pasta gives the sandbox its own network stack with internet
+            // access; the setup script then blocks every private destination
+            // before bubblewrap drops the rights to change that.
+            let mut args = isolation.pasta_args();
+            args.extend([
+                "--".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                isolation.script(),
+                "sh".into(),
+                bwrap,
+            ]);
+            args.extend(out);
+            return Ok((isolation.pasta.to_string_lossy().into_owned(), args));
+        }
+        Ok((bwrap, out))
+    }
+
+    /// What network the sandbox gets: none, internet only, or the full network
+    /// (including services on this computer and the LAN).
+    pub fn network_access(&self) -> &'static str {
+        if !self.network {
+            "none"
+        } else if net_isolation().is_some() {
+            "internet only (this computer and the local network are blocked)"
+        } else {
+            "full, including services on this computer and the local network"
+        }
     }
 
     /// A short description for approval previews.
@@ -179,6 +223,7 @@ impl SandboxPolicy {
             "writable": self.writable,
             "read_only": self.read_only,
             "network": self.network,
+            "network_access": self.network_access(),
             "home": "empty",
         })
     }
@@ -257,6 +302,161 @@ fn protect_writable_root(out: &mut Vec<String>, root: &Path) {
             break;
         }
     }
+}
+
+/// Destinations blocked inside an isolated network: private, link-local and
+/// shared-address ranges, so neither this computer (other than through its
+/// public address) nor the LAN is reachable.
+const PRIVATE_V4: [&str; 5] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+];
+const PRIVATE_V6: [&str; 2] = ["fc00::/7", "fe80::/10"];
+
+/// Internet-only networking for sandboxed commands, via pasta (passt).
+struct NetIsolation {
+    pasta: PathBuf,
+    ip: PathBuf,
+    nameservers: Vec<std::net::IpAddr>,
+    resolv_file: PathBuf,
+    resolv_target: PathBuf,
+}
+
+impl NetIsolation {
+    fn pasta_args(&self) -> Vec<String> {
+        // No port forwarding in either direction, and no mapping of the
+        // gateway address to the host: the namespace's loopback is its own.
+        let mut args: Vec<String> = [
+            "--config-net",
+            "--no-map-gw",
+            "--quiet",
+            "-t",
+            "none",
+            "-u",
+            "none",
+            "-T",
+            "none",
+            "-U",
+            "none",
+        ]
+        .map(String::from)
+        .to_vec();
+        for server in &self.nameservers {
+            args.extend(["-D".into(), server.to_string()]);
+        }
+        args
+    }
+
+    /// Runs as root of pasta's namespace: policy rules (checked before any
+    /// route, including the copied LAN route) prohibit private destinations,
+    /// except the configured DNS servers. bubblewrap then starts a new user
+    /// namespace without the capability to change them.
+    fn script(&self) -> String {
+        let ip = shell_quote(&self.ip.to_string_lossy());
+        let mut script = String::from("set -e\n");
+        for server in &self.nameservers {
+            let family = if server.is_ipv6() { "-6 " } else { "" };
+            script.push_str(&format!(
+                "{ip} {family}rule add to {server} lookup main priority 50\n"
+            ));
+        }
+        for range in PRIVATE_V4 {
+            script.push_str(&format!("{ip} rule add to {range} prohibit priority 100\n"));
+        }
+        for range in PRIVATE_V6 {
+            script.push_str(&format!(
+                "{ip} -6 rule add to {range} prohibit priority 100 || true\n"
+            ));
+        }
+        script.push_str("exec \"$@\"\n");
+        script
+    }
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn nameservers_in(path: &Path) -> Vec<std::net::IpAddr> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver"))
+        .filter_map(|rest| rest.trim().split('%').next()?.parse().ok())
+        .filter(|ip: &std::net::IpAddr| !ip.is_loopback() && !ip.is_unspecified())
+        .take(3)
+        .collect()
+}
+
+/// The upstream resolvers: /etc/resolv.conf, or systemd-resolved's list when
+/// /etc/resolv.conf only names its local stub (unreachable from the sandbox).
+fn upstream_nameservers() -> Vec<std::net::IpAddr> {
+    let direct = nameservers_in(Path::new("/etc/resolv.conf"));
+    if direct.is_empty() {
+        nameservers_in(Path::new("/run/systemd/resolve/resolv.conf"))
+    } else {
+        direct
+    }
+}
+
+/// Internet-only networking, when pasta and ip are installed, upstream DNS
+/// servers are known and a trial run succeeds. Checked once per run.
+fn net_isolation() -> Option<&'static NetIsolation> {
+    static ISOLATION: OnceLock<Option<NetIsolation>> = OnceLock::new();
+    ISOLATION
+        .get_or_init(|| {
+            let pasta = crate::diagnostics::find_executable("pasta")?;
+            let ip = crate::diagnostics::find_executable("ip")?;
+            let nameservers = upstream_nameservers();
+            if nameservers.is_empty() {
+                return None;
+            }
+            let resolv_target = std::fs::canonicalize("/etc/resolv.conf")
+                .unwrap_or_else(|_| PathBuf::from("/etc/resolv.conf"));
+            let directory = crate::settings::data_dir().ok()?.join("sandbox");
+            std::fs::create_dir_all(&directory).ok()?;
+            let resolv_file = directory.join("resolv.conf");
+            let contents: String = nameservers
+                .iter()
+                .map(|ip| format!("nameserver {ip}\n"))
+                .collect();
+            let temporary = directory.join("resolv.conf.tmp");
+            std::fs::write(&temporary, contents).ok()?;
+            std::fs::rename(&temporary, &resolv_file).ok()?;
+            let isolation = NetIsolation {
+                pasta,
+                ip,
+                nameservers,
+                resolv_file,
+                resolv_target,
+            };
+            let mut args = isolation.pasta_args();
+            args.extend([
+                "--".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                isolation.script(),
+                "sh".into(),
+                "true".into(),
+            ]);
+            let works = std::process::Command::new(&isolation.pasta)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            works.then_some(isolation)
+        })
+        .as_ref()
+}
+
+/// Whether sandboxed commands with network access get internet-only networking.
+pub fn network_isolation_available() -> bool {
+    net_isolation().is_some()
 }
 
 fn push<const N: usize>(out: &mut Vec<String>, items: [&str; N]) {
@@ -357,6 +557,67 @@ mod tests {
             .wrap("true", &[], outside.path(), &BTreeMap::new(), false)
             .unwrap_err();
         assert!(error.to_string().contains("outside"), "{error}");
+    }
+
+    #[test]
+    fn isolated_network_cannot_reach_this_computer_or_private_addresses() {
+        if !available() || !network_isolation_available() {
+            eprintln!("pasta isolation unavailable; skipping");
+            return;
+        }
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let project = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::for_workspace(project.path(), &[], true);
+        assert!(policy.network_access().starts_with("internet only"));
+        let probe = format!(
+            "import socket\n\
+             for host in ['127.0.0.1', '10.255.255.1', '192.168.255.1']:\n\
+             \x20   try:\n\
+             \x20       socket.create_connection((host, {port}), timeout=2); print(host, 'REACHED')\n\
+             \x20   except OSError as e:\n\
+             \x20       print(host, 'blocked')\n"
+        );
+        let (program, args) = policy
+            .wrap(
+                "python3",
+                &["-I".into(), "-c".into(), probe],
+                project.path(),
+                &BTreeMap::new(),
+                false,
+            )
+            .unwrap();
+        let output = Command::new(program).args(args).output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert!(!text.contains("REACHED"), "{text}");
+        assert_eq!(text.matches("blocked").count(), 3, "{text}");
+        let (_, ids) = run(
+            &policy,
+            project.path(),
+            "id -u; touch made; stat -c %u made",
+        );
+        let uid = unsafe { libc::getuid() }.to_string();
+        assert_eq!(
+            ids.split_whitespace().collect::<Vec<_>>(),
+            [uid.as_str(), uid.as_str()],
+            "{ids}"
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::uid(
+                &std::fs::metadata(project.path().join("made")).unwrap()
+            )
+            .to_string(),
+            uid
+        );
+        // The sandboxed program cannot lift the rules.
+        let (ok, output) = run(
+            &policy,
+            project.path(),
+            "ip rule del priority 100 && echo LIFTED",
+        );
+        assert!(!output.contains("LIFTED"), "{ok} {output}");
+        drop(listener);
     }
 
     #[test]
