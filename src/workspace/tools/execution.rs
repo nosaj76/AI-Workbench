@@ -150,6 +150,11 @@ impl ToolEngine {
                 self.remove_confined(path)?;
                 Ok(json!({"ok":true,"removed":path,"recoverable_copy":backup}))
             }
+            Operation::GitCommit {
+                message,
+                paths,
+                branch,
+            } => self.execute_git_commit(message, paths, branch.as_deref()),
             Operation::MakeDirectory { path } => {
                 let target = self.workspace.resolve(path, true)?;
                 self.create_dir_confined(&target)?;

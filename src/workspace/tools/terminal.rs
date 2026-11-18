@@ -364,7 +364,7 @@ fn read_options(args: &Value, default_wait: u64) -> Result<(u64, usize)> {
     ))
 }
 
-fn optional_string(args: &Value, key: &str) -> Result<Option<String>> {
+pub(super) fn optional_string(args: &Value, key: &str) -> Result<Option<String>> {
     args.get(key)
         .map(|value| {
             let value = value
