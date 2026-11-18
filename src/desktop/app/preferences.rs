@@ -138,6 +138,17 @@ impl Workbench {
             }
             ui.label("Folders the sandbox may read (one per line, ~/ allowed)");
             ui.add(egui::TextEdit::multiline(&mut draft.sandbox_read_only_paths).desired_rows(3).desired_width(f32::INFINITY));
+            ui.horizontal(|ui| {
+                ui.label("Check after file changes");
+                ui.add(egui::TextEdit::singleline(&mut draft.check_after_edits).desired_width(260.0));
+            });
+            let check_help = match crate::tools::CheckMode::parse(&draft.check_after_edits) {
+                Ok(crate::tools::CheckMode::Off) => "Off: the model sees only that files were saved.".to_string(),
+                Ok(crate::tools::CheckMode::Auto) => "auto: after each approved change, runs cargo check, go build, or a syntax check of changed Python/JavaScript files in the sandbox (no network) and shows the model the errors. Needs the sandbox.".to_string(),
+                Ok(crate::tools::CheckMode::Custom(argv)) => format!("Runs {} in the sandbox after each approved change.", argv.join(" ")),
+                Err(e) => e.to_string(),
+            };
+            ui.small(check_help);
             let sandboxed = draft.command_sandbox != "off" && sandbox_ready;
             if draft.auto_approve_unsandboxed {
                 ui.colored_label(

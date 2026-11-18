@@ -138,6 +138,12 @@ refuses to run commands without the sandbox. **Off** runs them with your normal
 permissions. Terminals you open yourself, and adapters, MCP servers and external
 agents you configure, are not sandboxed. `setup.sh` installs bubblewrap.
 
+After each approved file change, **Check after file changes** (default
+`auto`) runs `cargo check`, `go build`, or a syntax check of the changed Python
+or JavaScript files in the sandbox, without network, and shows the model the
+errors. Set it to `off`, or to your own command as a JSON array such as
+`["make","check"]`. It never runs outside the sandbox.
+
 Terminals you open yourself are private: the assistant cannot list, read or
 type into them unless you tick **AI may use** for that terminal in the
 Terminals panel. It can always use the terminals it opened.
