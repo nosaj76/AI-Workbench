@@ -147,6 +147,7 @@ pub(super) fn bounded_tool_result(result: &Value, max_chars: usize) -> (Value, b
             "complete",
             "coverage",
             "resume_after",
+            "resume_line",
             "returned_start_line",
             "returned_end_line",
             "total_lines",

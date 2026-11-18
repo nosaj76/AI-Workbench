@@ -102,6 +102,8 @@ enum WorkEvent {
         entries: Vec<FileEntry>,
     },
     Preview {
+        source_text: bool,
+        truncated: bool,
         request_id: u64,
         root: String,
         path: String,
@@ -192,6 +194,8 @@ pub struct Workbench {
     preview: String,
     preview_original: String,
     preview_note: String,
+    preview_source_text: bool,
+    preview_truncated: bool,
     new_path: String,
     model_pull: String,
     model_new: String,
@@ -321,6 +325,8 @@ impl Workbench {
             preview: String::new(),
             preview_original: String::new(),
             preview_note: String::new(),
+            preview_source_text: false,
+            preview_truncated: false,
             new_path: String::new(),
             model_pull: String::new(),
             model_new: String::new(),
@@ -435,31 +441,6 @@ impl eframe::App for Workbench {
         self.approve(false);
         self.persist();
     }
-}
-
-fn is_editable_text(path: &str) -> bool {
-    let ext = Path::new(path)
-        .extension()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    !matches!(
-        ext.as_str(),
-        "pdf"
-            | "docx"
-            | "odt"
-            | "pptx"
-            | "xlsx"
-            | "epub"
-            | "png"
-            | "jpg"
-            | "jpeg"
-            | "webp"
-            | "gif"
-            | "doc"
-            | "xls"
-            | "ppt"
-    )
 }
 
 #[cfg(test)]

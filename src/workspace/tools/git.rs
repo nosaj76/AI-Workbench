@@ -15,7 +15,7 @@ const MAX_DIFF_CHARS: usize = 60_000;
 const MAX_MESSAGE: usize = 4_000;
 
 /// Settings that keep git from running programs named by repository config.
-const HARDENING: [&str; 14] = [
+const HARDENING: [&str; 15] = [
     "-c",
     "core.fsmonitor=false",
     "-c",
@@ -30,6 +30,7 @@ const HARDENING: [&str; 14] = [
     "core.sshCommand=false",
     "--no-pager",
     "--no-optional-locks",
+    "--literal-pathspecs",
 ];
 
 pub(super) fn definitions() -> Vec<Value> {
@@ -289,7 +290,12 @@ impl ToolEngine {
             add.extend(paths.iter().map(String::as_str));
         }
         self.git_ok(&add, false)?;
-        self.git_ok(&["commit", "--no-verify", "--quiet", "-m", message], false)?;
+        let mut commit = vec!["commit", "--no-verify", "--quiet", "-m", message];
+        if !paths.is_empty() {
+            commit.extend(["--only", "--"]);
+            commit.extend(paths.iter().map(String::as_str));
+        }
+        self.git_ok(&commit, false)?;
         let commit = self.git_ok(&["log", "-1", "--format=%h %s"], true)?;
         Ok(json!({"ok": true, "commit": commit.trim(), "branch": branch}))
     }
@@ -333,6 +339,20 @@ mod tests {
             PreparedTool::Immediate(v) => v,
             PreparedTool::Approval(_) => panic!("{name} must not need approval"),
         }
+    }
+
+    #[test]
+    fn selected_commit_leaves_other_staged_work_in_the_index() {
+        let (dir, _backups, engine) = repo();
+        std::fs::write(dir.path().join("unrelated"), "work in progress").unwrap();
+        git(dir.path(), &["add", "unrelated"]);
+        std::fs::write(dir.path().join("selected"), "new file").unwrap();
+        let PreparedTool::Approval(action) = engine.prepare(
+            "git_commit", &json!({"message":"selected only","paths":["selected"]})
+        ).unwrap() else { panic!("expected preview") };
+        engine.approve(&action).unwrap();
+        assert_eq!(engine.git_ok(&["diff", "--name-only", "HEAD^", "HEAD"], true).unwrap().trim(), "selected");
+        assert_eq!(engine.git_ok(&["diff", "--cached", "--name-only"], true).unwrap().trim(), "unrelated");
     }
 
     #[test]

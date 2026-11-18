@@ -159,7 +159,8 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     app.preview = "new preview".into();
     app.work_tx
         .send(WorkEvent::Preview {
-            request_id: 1,
+            source_text: true,
+            truncated: false,            request_id: 1,
             root: "fixture-project".into(),
             path: "old.txt".into(),
             text: "old preview".into(),
@@ -170,7 +171,8 @@ fn an_older_file_read_cannot_replace_the_last_selected_preview() {
     assert_eq!(app.preview, "new preview");
     app.work_tx
         .send(WorkEvent::Preview {
-            request_id: 2,
+            source_text: true,
+            truncated: false,            request_id: 2,
             root: "fixture-project".into(),
             path: "new.txt".into(),
             text: "selected preview".into(),
@@ -502,6 +504,7 @@ fn cancellation_between_tool_result_and_followup_gets_a_saved_explanation() {
 #[test]
 fn chat_tool_engine_setup_failure_is_saved_before_worker_launch() {
     let (dir, _ctx, mut app) = fixture();
+    app.demo = false;
     app.session = Session::default();
     app.session.project = Some(dir.path().display().to_string());
     app.settings.tools_enabled = true;
@@ -1090,4 +1093,25 @@ fn background_failure_does_not_attach_to_a_previous_turn() {
         .entries
         .iter()
         .all(|e| e.stats.get("background_failures").is_none()));
+}
+
+#[test]
+fn demo_model_actions_never_start_a_worker_or_contact_ollama() {
+    let (_dir, _ctx, mut app) = fixture();
+    let mock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    mock.set_nonblocking(true).unwrap();
+    app.settings.base_url = format!("http://{}", mock.local_addr().unwrap());
+    let original = app.session.id.clone();
+    app.refresh_models();
+    for action in ["show", "pull", "unload", "delete", "copy", "create", "import"] {
+        app.model_action(action, "demo-model");
+    }
+    app.compare_models = "first,second".into();
+    app.start_comparison();
+    app.regenerate();
+    app.launch_chat(Vec::new(), "demo-model".into());
+    assert!(!app.busy && !app.work_busy);
+    assert_eq!(app.active_work, 0);
+    assert_eq!(app.session.id, original);
+    assert_eq!(mock.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
 }

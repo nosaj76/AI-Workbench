@@ -555,7 +555,8 @@ pub(super) async fn run_chat(
     // libraries first: a small model does not reliably choose that search by itself.
     // Only when web searches are already allowed without asking; the query stays on
     // this computer.
-    if job.settings.network_tools
+    if job.settings.tools_enabled
+        && job.settings.network_tools
         && job.settings.auto_approve_web
         && !job.settings.local_sites_url.trim().is_empty()
         && !explicit_web_search

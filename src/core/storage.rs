@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -119,6 +120,24 @@ pub fn request_messages(entries: &[Entry]) -> Vec<ChatMessage> {
         .collect()
 }
 
+#[derive(Clone, Debug)]
+pub struct SavedSession {
+    id: String,
+    revision: i64,
+    fingerprint: [u8; 32],
+}
+
+#[derive(Debug)]
+pub struct SessionConflict;
+
+impl std::fmt::Display for SessionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Another window changed or removed this conversation")
+    }
+}
+
+impl std::error::Error for SessionConflict {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -135,6 +154,8 @@ pub struct Session {
     /// message; while it is unchanged, routing keeps the conversation's model.
     #[serde(default)]
     pub selected_model: Option<String>,
+    #[serde(skip)]
+    pub saved: Option<SavedSession>,
 }
 
 impl Default for Session {
@@ -149,6 +170,7 @@ impl Default for Session {
             deleted_at: None,
             entries: vec![],
             selected_model: None,
+            saved: None,
         }
     }
 }
@@ -178,19 +200,24 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        let conn = Connection::open(dir.join("workbench.sqlite3"))?;
+        let mut conn = Connection::open(dir.join("workbench.sqlite3"))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, project TEXT, updated_at TEXT NOT NULL, pinned INTEGER NOT NULL, archived INTEGER NOT NULL, data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, session_id TEXT, action TEXT NOT NULL, details TEXT NOT NULL);")?;
         // Old 0.1–0.4 stores did not have Trash. Add a nullable column in place;
         // their JSON remains readable because Session.deleted_at has a default.
+        let migration = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let column_names = {
-            let mut columns = conn.prepare("PRAGMA table_info(sessions)")?;
+            let mut columns = migration.prepare("PRAGMA table_info(sessions)")?;
             let rows = columns.query_map([], |row| row.get::<_, String>(1))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         if !column_names.iter().any(|name| name == "deleted_at") {
-            conn.execute("ALTER TABLE sessions ADD COLUMN deleted_at TEXT", [])?;
+            migration.execute("ALTER TABLE sessions ADD COLUMN deleted_at TEXT", [])?;
         }
+        if !column_names.iter().any(|name| name == "revision") {
+            migration.execute("ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1", [])?;
+        }
+        migration.commit()?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_sessions_trash ON sessions(deleted_at, archived, pinned, updated_at);")?;
         crate::conversation_diagnostics::initialize(&conn)?;
         Ok(Self {
@@ -201,15 +228,49 @@ impl Store {
     }
 
     pub fn save(&self, session: &mut Session) -> Result<()> {
-        session.updated_at = Utc::now().to_rfc3339();
-        let data = serde_json::to_string(session)?;
-        self.conn.execute("INSERT INTO sessions (id,title,project,updated_at,pinned,archived,deleted_at,data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,project=excluded.project,updated_at=excluded.updated_at,pinned=excluded.pinned,archived=excluded.archived,deleted_at=excluded.deleted_at,data=excluded.data", params![session.id,session.title,session.project,session.updated_at,session.pinned,session.archived,session.deleted_at,data])?;
+        let saved = session.saved.as_ref().filter(|v| v.id == session.id);
+        let fingerprint: [u8; 32] = Sha256::digest(serde_json::to_vec(session)?).into();
+        if saved.is_none_or(|v| v.fingerprint != fingerprint) {
+            let revision = saved.map(|v| v.revision);
+            let previous_time = std::mem::replace(&mut session.updated_at, Utc::now().to_rfc3339());
+            let result = self.write_session(session, revision);
+            match result {
+                Ok(version) => session.saved = Some(version),
+                Err(error) => {
+                    session.updated_at = previous_time;
+                    return Err(error);
+                }
+            }
+        }
         // Conversation persistence must succeed even if its diagnostic export fails.
         if let Err(error) = self.diagnose_session(session, true) {
             *self.diagnostic_error.borrow_mut() = Some(format!("{error:#}"));
             eprintln!("Conversation saved; diagnostic logging failed: {error:#}");
         }
         Ok(())
+    }
+
+    fn write_session(&self, session: &Session, revision: Option<i64>) -> Result<SavedSession> {
+        let data = serde_json::to_string(session)?;
+        let fields = params![session.id, session.title, session.project, session.updated_at,
+            session.pinned, session.archived, session.deleted_at, data, revision];
+        let changed = if revision.is_some() {
+            self.conn.execute(
+                "UPDATE sessions SET title=?2,project=?3,updated_at=?4,pinned=?5,archived=?6,
+                 deleted_at=?7,data=?8,revision=revision+1 WHERE id=?1 AND revision=?9", fields)?
+        } else {
+            self.conn.execute(
+                "INSERT INTO sessions(id,title,project,updated_at,pinned,archived,deleted_at,data,revision)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1) ON CONFLICT(id) DO NOTHING", &fields[..8])?
+        };
+        if changed == 0 {
+            return Err(SessionConflict.into());
+        }
+        Ok(SavedSession {
+            id: session.id.clone(),
+            revision: revision.unwrap_or(0) + 1,
+            fingerprint: Sha256::digest(data.as_bytes()).into(),
+        })
     }
 
     pub fn diagnostic_error(&self) -> Option<String> {
@@ -263,13 +324,17 @@ impl Store {
     }
 
     pub fn load(&self, id: &str) -> Result<Session> {
-        let data: String =
-            self.conn
-                .query_row("SELECT data FROM sessions WHERE id=?1", [id], |row| {
-                    row.get(0)
-                })?;
-        serde_json::from_str(&data)
-            .context("Stored conversation could not be decoded; it has not been overwritten")
+        let (data, revision): (String, i64) = self.conn.query_row(
+            "SELECT data,revision FROM sessions WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?))
+        )?;
+        let mut session: Session = serde_json::from_str(&data)
+            .context("Stored conversation could not be decoded; it has not been overwritten")?;
+        session.saved = Some(SavedSession {
+            id: session.id.clone(),
+            revision,
+            fingerprint: Sha256::digest(serde_json::to_vec(&session)?).into(),
+        });
+        Ok(session)
     }
 
     pub fn list(&self, query: &str, include_archived: bool) -> Result<Vec<SessionSummary>> {
@@ -585,6 +650,28 @@ mod trash_tests {
         store.move_to_trash(&session.id).unwrap();
         store.delete_trashed_permanently(&session.id).unwrap();
         assert!(store.load(&session.id).is_err());
+    }
+
+    #[test]
+    fn stale_windows_cannot_overwrite_or_resurrect_a_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Store::open(dir.path()).unwrap();
+        let second = Store::open(dir.path()).unwrap();
+        let mut current = Session::default();
+        first.save(&mut current).unwrap();
+        let mut idle = second.load(&current.id).unwrap();
+        current.title = "Newer conversation".into();
+        first.save(&mut current).unwrap();
+        second.save(&mut idle).unwrap();
+        assert_eq!(first.load(&current.id).unwrap().title, current.title);
+        idle.title = "Concurrent edit".into();
+        assert!(second.save(&mut idle).unwrap_err().is::<SessionConflict>());
+        first.delete(&current.id).unwrap();
+        assert!(second.save(&mut idle).unwrap_err().is::<SessionConflict>());
+        assert!(first.load(&current.id).is_err());
+        idle.id = uuid::Uuid::new_v4().to_string();
+        second.save(&mut idle).unwrap();
+        assert_eq!(first.load(&idle.id).unwrap().title, "Concurrent edit");
     }
 
     #[test]

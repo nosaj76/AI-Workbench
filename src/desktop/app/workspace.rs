@@ -315,6 +315,8 @@ impl Workbench {
                         }
                     );
                     tx.send(WorkEvent::Preview {
+                        source_text: document.source_text,
+                        truncated: document.truncated,
                         request_id,
                         root,
                         path,
@@ -498,10 +500,14 @@ impl Workbench {
             columns[0].separator();columns[0].label(RichText::new("Ignored build folders, secrets, binaries, and paths outside this workspace are excluded.").small().color(columns[0].visuals().weak_text_color()));
             let ui=&mut columns[1];
             if self.preview_path.is_empty(){ui.label("Select a file to preview it.");}else{
-                ui.label(RichText::new(&self.preview_path).strong());ui.label(RichText::new(&self.preview_note).small());if !is_editable_text(&self.preview_path){ui.label(RichText::new("Extracted document text: attach for review; editing cannot overwrite this document format.").small().color(ui.visuals().warn_fg_color));}
+                ui.label(RichText::new(&self.preview_path).strong());ui.label(RichText::new(&self.preview_note).small());if !self.preview_source_text{ui.label(RichText::new("Extracted document text: attach for review; editing cannot overwrite this document format.").small().color(ui.visuals().warn_fg_color));}
                 ui.horizontal_wrapped(|ui|{if ui.add_enabled(!self.work_busy,egui::Button::new("Attach to chat")).clicked(){if let Ok(ws)=self.workspace(){if let Ok(path)=ws.resolve(&self.preview_path,false){self.attach_files(vec![path]);}}}
 if ui.button("Review file").clicked(){if let Ok(ws)=self.workspace(){if let Ok(path)=ws.resolve(&self.preview_path,false){self.input=format!("Review {} thoroughly. Explain its purpose, find concrete problems, and cite source lines.",self.preview_path);self.attach_files(vec![path]);}}}
-if ui.add_enabled(self.preview!=self.preview_original&&!self.preview_note.contains("TRUNCATED")&&is_editable_text(&self.preview_path),egui::Button::new("Review & save edit")).clicked(){match self.workspace().and_then(|w|w.read_text(&self.preview_path,200_000)){Ok(current)if current.text==self.preview_original=>self.manual_tool("write_file",json!({"path":self.preview_path,"content":self.preview})),Ok(_)=>self.error=Some("The file changed since you opened it. Reload before saving this edit.".into()),Err(e)=>self.error=Some(e.to_string())}}});
+if ui.add_enabled(self.preview!=self.preview_original&&!self.preview_truncated&&self.preview_source_text,egui::Button::new("Review & save edit")).clicked(){match self.workspace().and_then(|w|w.read_text(&self.preview_path,200_000)){Ok(current)if current.source_text && !current.truncated && current.text==self.preview_original=>self.manual_tool("write_file",json!({"path":self.preview_path,"content":self.preview})),Ok(_)=>self.error=Some("The file changed since you opened it. Reload before saving this edit.".into()),Err(e)=>self.error=Some(e.to_string())}}});
+                if !self.preview_source_text && ui.button("Export preview as text…").clicked() {
+                    let destination = format!("{}.txt", self.preview_path);
+                    self.manual_tool("write_file", json!({"path":destination,"content":self.preview}));
+                }
                 egui::ScrollArea::both().id_salt("file_preview").max_height((ui.available_height()-110.0).max(140.0)).show(ui,|ui|{ui.add(egui::TextEdit::multiline(&mut self.preview).code_editor().desired_width(f32::INFINITY).desired_rows(24));});
                 ui.horizontal(|ui|{if ui.button("Discard editor changes").clicked(){self.preview=self.preview_original.clone();}
 if ui.button("Move to recovery…").clicked(){self.manual_tool("delete_file",json!({"path":self.preview_path}));}});

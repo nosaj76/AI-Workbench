@@ -97,6 +97,9 @@ impl Workbench {
     }
 
     pub(super) fn index_workspace(&mut self, embeddings: bool) {
+        if self.demo && embeddings {
+            return;
+        }
         let Some(root) = self.session.project.clone() else {
             return;
         };
@@ -123,6 +126,9 @@ impl Workbench {
     }
 
     pub(super) fn search_knowledge(&mut self) {
+        if self.demo && !self.settings.embedding_model.trim().is_empty() {
+            return;
+        }
         let Some(root) = self.session.project.clone() else {
             return;
         };
