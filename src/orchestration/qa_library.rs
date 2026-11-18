@@ -253,12 +253,69 @@ pub fn normalize_question(question: &str) -> String {
     words.into_iter().collect::<Vec<_>>().join(" ")
 }
 
+/// Words that say how a question is asked rather than what it asks ("in the
+/// command line", "using the terminal", "the easiest way"). Ignored when
+/// comparing questions only; stored keys keep them.
+const PHRASING_WORDS: &[&str] = &[
+    // Left over from contractions ("what's", "don't", "I'd").
+    "s",
+    "t",
+    "ll",
+    "re",
+    "ve",
+    "d",
+    "m",
+    "command",
+    "line",
+    "commandline",
+    "terminal",
+    "cli",
+    "shell",
+    "console",
+    "using",
+    "use",
+    "via",
+    "easiest",
+    "easy",
+    "simplest",
+    "simple",
+    "quickly",
+    "quick",
+    "properly",
+    "correctly",
+    "exactly",
+    "step",
+    "steps",
+    "help",
+    "need",
+    "want",
+    "know",
+    "tell",
+    "explain",
+];
+
 fn similarity(a: &str, b: &str) -> f64 {
     if a == b {
         return 1.0;
     }
-    let a: BTreeSet<&str> = a.split(' ').filter(|w| !w.is_empty()).collect();
-    let b: BTreeSet<&str> = b.split(' ').filter(|w| !w.is_empty()).collect();
+    let significant = |text: &str| -> BTreeSet<String> {
+        let all: BTreeSet<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+        let kept: BTreeSet<String> = all
+            .iter()
+            .filter(|w| !PHRASING_WORDS.contains(w))
+            .map(|w| w.to_string())
+            .collect();
+        // A question made only of such words keeps them all.
+        if kept.len() >= 3 {
+            kept
+        } else {
+            all.into_iter().map(str::to_owned).collect()
+        }
+    };
+    let (a, b) = (significant(a), significant(b));
+    if a == b && a.len() >= 3 {
+        return 1.0;
+    }
     // Short questions must match exactly; one word changes their meaning.
     if a.len() < 3 || b.len() < 3 {
         return 0.0;
@@ -1021,6 +1078,23 @@ mod tests {
         let c = normalize_question("best way to undo last local git commit");
         assert!(similarity(&a, &c) >= SIMILARITY_THRESHOLD);
         assert_eq!(similarity("rust lifetimes", "rust traits"), 0.0);
+    }
+
+    #[test]
+    fn rewordings_about_how_a_question_is_asked_still_match() {
+        // Seen in a live chat: the model asked the same question two ways.
+        let saved = normalize_question("how to rename a local git branch in command line");
+        let asked = normalize_question("How do I rename a local Git branch?");
+        assert!(similarity(&asked, &saved) >= SIMILARITY_THRESHOLD);
+        let terminal =
+            normalize_question("What's the easiest way to rename a git branch using the terminal?");
+        let plain = normalize_question("rename a git branch");
+        assert!(similarity(&terminal, &plain) >= SIMILARITY_THRESHOLD);
+        // A different subject still does not match.
+        let delete = normalize_question("How do I delete a local Git branch?");
+        assert!(similarity(&asked, &delete) < SIMILARITY_THRESHOLD);
+        let remote = normalize_question("How do I rename a remote Git branch?");
+        assert!(similarity(&asked, &remote) < SIMILARITY_THRESHOLD);
     }
 
     #[test]
