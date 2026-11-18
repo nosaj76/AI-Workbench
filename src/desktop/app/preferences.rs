@@ -134,7 +134,11 @@ impl Workbench {
             });
             ui.checkbox(&mut draft.sandbox_network, "Allow network access inside the sandbox");
             if draft.sandbox_network {
-                ui.small("This includes services on this computer and your LAN, such as Ollama's API on 127.0.0.1:11434, which can delete or download models.");
+                ui.small(if crate::sandbox::network_isolation_available() {
+                    "Internet only: pasta gives the sandbox its own network, and services on this computer and your LAN (such as Ollama) are blocked."
+                } else {
+                    "This includes services on this computer and your LAN, such as Ollama's API on 127.0.0.1:11434, which can delete or download models. Install passt (sudo apt install passt) to allow the internet only."
+                });
             }
             ui.label("Folders the sandbox may read (one per line, ~/ allowed)");
             ui.add(egui::TextEdit::multiline(&mut draft.sandbox_read_only_paths).desired_rows(3).desired_width(f32::INFINITY));
