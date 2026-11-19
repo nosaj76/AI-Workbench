@@ -388,8 +388,7 @@ impl TerminalManager {
                 Ok(())
             });
         }
-        let child = command
-            .spawn()
+        let child = spawn_from_persistent_thread(command)
             .with_context(|| format!("Launch terminal executable {}", config.program))?;
         let pid = child.id();
         let state = Arc::new(Mutex::new(TerminalState {
@@ -918,6 +917,43 @@ impl Drop for TerminalSession {
     fn drop(&mut self) {
         self.terminate();
     }
+}
+
+/// Fork terminal processes from one thread that lives as long as the program.
+/// A sandboxed shell runs under `bwrap --die-with-parent`, which is
+/// PR_SET_PDEATHSIG: Linux kills it when the *thread* that forked it exits, not
+/// the process. Terminals are opened from short-lived workers such as Tokio's
+/// blocking pool, whose idle threads exit after ten seconds, so the shell was
+/// hung up seconds after it started. A persistent spawner keeps the protection
+/// (the sandbox still dies with the app) without tying it to a worker thread.
+#[cfg(unix)]
+fn spawn_from_persistent_thread(command: Command) -> std::io::Result<Child> {
+    type Job = (Command, std::sync::mpsc::Sender<std::io::Result<Child>>);
+    static SPAWNER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    let spawner = SPAWNER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("workbench-pty-spawner".into())
+            .spawn(move || {
+                for (mut command, reply) in rx {
+                    let _ = reply.send(command.spawn());
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    let mut command = command;
+    let Some(spawner) = spawner else {
+        return command.spawn();
+    };
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    if let Err(std::sync::mpsc::SendError((mut command, _))) = spawner.send((command, reply_tx)) {
+        return command.spawn();
+    }
+    reply_rx
+        .recv()
+        .unwrap_or_else(|_| Err(std::io::Error::other("Terminal spawner thread stopped")))
 }
 
 impl TerminalSession {
@@ -1467,5 +1503,48 @@ done
         );
         queries.process(b"\x1b[2;3H\x1b[6n\x1b[5n");
         assert_eq!(queries.callbacks().replies, b"\x1b[2;3R\x1b[0n");
+    }
+
+    /// The shell must outlive the worker thread that opened it. Under the
+    /// sandbox, `bwrap --die-with-parent` is tied to the forking thread; the
+    /// opener here lingers past bwrap's start and then exits, as a Tokio
+    /// blocking-pool thread does after ten idle seconds.
+    #[test]
+    fn sandboxed_shell_outlives_the_thread_that_opened_it() {
+        if !crate::sandbox::available() {
+            return;
+        }
+        let manager = TerminalManager::new();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        let opener = manager.clone();
+        let id = std::thread::spawn(move || {
+            let id = opener
+                .open(TerminalConfig {
+                    cwd: path.clone(),
+                    program: "bash".into(),
+                    args: vec!["--norc".into(), "--noprofile".into()],
+                    sandbox: Some(crate::sandbox::SandboxPolicy::for_workspace(
+                        &path,
+                        &[],
+                        false,
+                    )),
+                    ..Default::default()
+                })
+                .unwrap();
+            // Stay alive until bwrap has armed its parent-death signal.
+            std::thread::sleep(Duration::from_millis(1500));
+            id
+        })
+        .join()
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        let summary = manager.summary(&id).unwrap();
+        assert!(summary.sandboxed);
+        assert!(
+            summary.alive,
+            "sandboxed shell died with its opener thread: {summary:?}"
+        );
+        manager.close(&id).unwrap();
     }
 }

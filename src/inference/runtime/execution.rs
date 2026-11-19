@@ -1738,13 +1738,23 @@ pub(super) async fn run_chat(
         for call in calls {
             let function = call.function;
             let repeat_scope = repeat_scope(&function.name);
+            // Reopening is the only recovery once every AI terminal has exited;
+            // an identical earlier terminal_open no longer has a live result.
+            let reopen_after_exit = function.name == "terminal_open"
+                && engine.as_ref().is_some_and(|engine| {
+                    engine
+                        .terminal_manager()
+                        .ai_list()
+                        .iter()
+                        .all(|terminal| !terminal.alive)
+                });
             let duplicate = duplicate_tool_request(
                 &mut seen_tool_requests,
                 &function.name,
                 &function.arguments,
                 tool_state_epoch,
                 repeat_scope,
-            );
+            ) && !reopen_after_exit;
             if duplicate {
                 duplicates_this_round += 1;
                 let _ = tx.send(ChatEvent::Status(format!(

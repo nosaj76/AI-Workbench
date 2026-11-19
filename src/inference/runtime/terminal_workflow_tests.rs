@@ -458,3 +458,44 @@ fn explicit_cli_setup_failures_are_reported_before_contacting_a_model() {
         assert!(!data.path().join("workspaces").exists());
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn identical_terminal_open_is_allowed_again_after_the_shell_exited() {
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let open = json!({"program":"sh","args":["-c","exit 0"],"wait_ms":500});
+    let reopen = open.clone();
+    let server = MockOllama::start(move |round, payload| match round {
+        0 => call("terminal_open", open.clone()),
+        1 => {
+            std::thread::sleep(Duration::from_millis(300));
+            call("terminal_open", reopen.clone())
+        }
+        _ => {
+            assert!(
+                !payload["messages"]
+                    .to_string()
+                    .contains("\\\"duplicate\\\":true"),
+                "Reopening an exited terminal must not be skipped as a duplicate"
+            );
+            answer("The shell exited each time.")
+        }
+    });
+    let engine = engine(workspace.path(), data.path());
+    let terminals = engine.terminal_manager();
+    let transcript = chat(
+        job(
+            &server.endpoint,
+            "open a terminal",
+            data.path(),
+            Some(engine),
+        ),
+        true,
+    );
+    let _ = server.finish();
+    assert!(transcript.errors.is_empty(), "{:?}", transcript.errors);
+    assert_eq!(transcript.approvals, 2);
+    assert_eq!(terminals.list().len(), 2);
+    terminals.close_all();
+}
