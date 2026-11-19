@@ -112,8 +112,12 @@ Turn on **Enable explicit web fetch and search tools**, then use any one of:
   DuckDuckGo through the text browser, with Wikipedia, arXiv, Crossref, Hacker
   News and GitHub as additional sources.
 - **SearXNG:** enter your instance's URL.
-- **Brave Search:** enable the preset under **MCP servers and web search** and
-  enter an API key.
+- **Brave Search, Exa or Kagi:** add the preset under **MCP servers and web
+  search** and enter that provider's API key.
+
+Search depth (Speed, Balanced, Quality) is under **Options** in Chat. Image
+search works through SearXNG or the Kagi preset, and related searches appear
+under answers.
 
 Every search is shown for approval unless web actions are set to approve
 automatically. Details: [docs/WEB_SEARCH.md](docs/WEB_SEARCH.md).

@@ -20,6 +20,53 @@ const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26",
 
 pub const BRAVE_SEARCH_SERVER_ID: &str = "brave-search";
 pub const BRAVE_SEARCH_PACKAGE: &str = "@brave/brave-search-mcp-server@2.1.4";
+pub const EXA_SEARCH_SERVER_ID: &str = "exa-search";
+pub const EXA_SEARCH_PACKAGE: &str = "exa-mcp-server@3.4.3";
+pub const KAGI_SEARCH_SERVER_ID: &str = "kagi-search";
+pub const KAGI_SEARCH_PACKAGE: &str = "kagimcp==1.1.0";
+
+/// A ready-made web-search server: its pinned package, launcher and API key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchPreset {
+    pub id: &'static str,
+    pub provider: &'static str,
+    pub package: &'static str,
+    pub launcher: &'static str,
+    pub key_env: &'static str,
+    pub key_url: &'static str,
+}
+
+/// Official search MCP servers Workbench can add with one click. All start disabled.
+pub const SEARCH_PRESETS: [SearchPreset; 3] = [
+    SearchPreset {
+        id: BRAVE_SEARCH_SERVER_ID,
+        provider: "Brave Search",
+        package: BRAVE_SEARCH_PACKAGE,
+        launcher: "npx",
+        key_env: "BRAVE_API_KEY",
+        key_url: "https://brave.com/search/api/",
+    },
+    SearchPreset {
+        id: EXA_SEARCH_SERVER_ID,
+        provider: "Exa",
+        package: EXA_SEARCH_PACKAGE,
+        launcher: "npx",
+        key_env: "EXA_API_KEY",
+        key_url: "https://dashboard.exa.ai/api-keys",
+    },
+    SearchPreset {
+        id: KAGI_SEARCH_SERVER_ID,
+        provider: "Kagi",
+        package: KAGI_SEARCH_PACKAGE,
+        launcher: "uvx",
+        key_env: "KAGI_API_KEY",
+        key_url: "https://kagi.com/api/keys",
+    },
+];
+
+pub fn search_preset(id: &str) -> Option<&'static SearchPreset> {
+    SEARCH_PRESETS.iter().find(|preset| preset.id == id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpServerConfig {
@@ -63,6 +110,39 @@ pub struct McpWebSearchConfig {
     /// Provider-specific result-count ceiling. Workbench may impose a smaller bound.
     #[serde(default = "default_search_results")]
     pub max_results: usize,
+    /// Argument that receives a requested time range (day/week/month/year).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_range_argument: Option<String>,
+    /// Provider values for each time range, e.g. {"week": "pw"}. Empty: the standard word.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub time_range_values: BTreeMap<String, Value>,
+    /// Argument that receives the language code ("en" for "en-US").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_argument: Option<String>,
+    /// Argument that receives the region code ("US" for "en-US").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_argument: Option<String>,
+    /// Argument that receives a safe-search level (off/moderate/strict).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_search_argument: Option<String>,
+    /// Provider values for each safe-search level. Empty: the standard word.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub safe_search_values: BTreeMap<String, Value>,
+    /// How to search for images, when the provider can. Absent: no image search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_search: Option<McpImageSearchConfig>,
+}
+
+/// Image search through the same server: another tool, or the search tool with
+/// extra arguments (for example Kagi's `{"workflow": "images"}`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct McpImageSearchConfig {
+    /// A different advertised tool for images. Absent: the web-search tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Arguments added to image searches.
+    pub extra_arguments: BTreeMap<String, Value>,
 }
 
 impl Default for McpWebSearchConfig {
@@ -75,6 +155,13 @@ impl Default for McpWebSearchConfig {
             max_query_chars: default_search_query_chars(),
             max_query_words: None,
             max_results: default_search_results(),
+            time_range_argument: None,
+            time_range_values: BTreeMap::new(),
+            language_argument: None,
+            region_argument: None,
+            safe_search_argument: None,
+            safe_search_values: BTreeMap::new(),
+            image_search: None,
         }
     }
 }
@@ -190,10 +277,91 @@ impl McpWebSearchConfig {
         if !(1..=100).contains(&self.max_results) {
             bail!("MCP web-search max_results must be between 1 and 100");
         }
+        // Option arguments may share a name with a fixed argument (the fixed value
+        // is then the default), but never with the query or the limit.
+        for (argument, label) in [
+            (&self.time_range_argument, "time-range"),
+            (&self.language_argument, "language"),
+            (&self.region_argument, "region"),
+            (&self.safe_search_argument, "safe-search"),
+        ] {
+            if let Some(name) = argument {
+                validate_mcp_name(name, &format!("MCP web-search {label} argument"))?;
+                if *name == self.query_argument || self.limit_argument.as_ref() == Some(name) {
+                    bail!("MCP web-search {label} argument cannot replace the query or limit argument");
+                }
+            }
+        }
+        for (values, allowed, label) in [
+            (&self.time_range_values, &crate::integrations::TIME_RANGES[..], "time_range_values"),
+            (&self.safe_search_values, &crate::integrations::SAFE_SEARCH_LEVELS[..], "safe_search_values"),
+        ] {
+            if let Some(key) = values.keys().find(|k| !allowed.contains(&k.as_str())) {
+                bail!("MCP web-search {label} has unknown key {key:?}; use {}", allowed.join(", "));
+            }
+            if serde_json::to_vec(values)?.len() > 4 * 1024 {
+                bail!("MCP web-search {label} exceed 4 KiB");
+            }
+        }
+        if let Some(images) = &self.image_search {
+            if let Some(tool) = &images.tool {
+                validate_mcp_name(tool, "MCP image-search tool")?;
+            }
+            if images.extra_arguments.len() > 16
+                || serde_json::to_vec(&images.extra_arguments)?.len() > 4 * 1024
+            {
+                bail!("MCP image-search arguments exceed 16 entries or 4 KiB");
+            }
+            if images.extra_arguments.contains_key(&self.query_argument)
+                || self
+                    .limit_argument
+                    .as_ref()
+                    .is_some_and(|name| images.extra_arguments.contains_key(name))
+            {
+                bail!("MCP image-search arguments cannot replace the query or limit argument");
+            }
+        }
         Ok(())
     }
 
+    /// The tool and arguments for a web or image search, and which standard
+    /// options the arguments carry.
+    pub fn request(
+        &self,
+        query: &str,
+        limit: usize,
+        options: &crate::integrations::SearchOptions,
+        images: bool,
+    ) -> Result<(String, Value, Vec<&'static str>)> {
+        let (mut arguments, applied) = self.arguments_with(query, limit, options)?;
+        if !images {
+            return Ok((self.tool.clone(), arguments, applied));
+        }
+        let config = self
+            .image_search
+            .as_ref()
+            .context("This search server is not set up for image search")?;
+        if let Some(object) = arguments.as_object_mut() {
+            for (key, value) in &config.extra_arguments {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        Ok((config.tool.clone().unwrap_or_else(|| self.tool.clone()), arguments, applied))
+    }
+
     pub fn arguments(&self, query: &str, limit: usize) -> Result<Value> {
+        Ok(self
+            .arguments_with(query, limit, &crate::integrations::SearchOptions::default())?
+            .0)
+    }
+
+    /// Tool arguments for a search, and which standard options they carry.
+    pub fn arguments_with(
+        &self,
+        query: &str,
+        limit: usize,
+        options: &crate::integrations::SearchOptions,
+    ) -> Result<(Value, Vec<&'static str>)> {
         self.validate()?;
         let chars = query.chars().count();
         if chars == 0 || chars > self.max_query_chars {
@@ -224,7 +392,39 @@ impl McpWebSearchConfig {
         if let Some(name) = &self.limit_argument {
             arguments.insert(name.clone(), json!(limit));
         }
-        Ok(Value::Object(arguments))
+        let mut applied = Vec::new();
+        // A value of null marks a word the provider does not support: nothing
+        // is sent and the option is reported as not applied.
+        let mapped = |values: &BTreeMap<String, Value>, word: &str| match values.get(word) {
+            Some(Value::Null) => None,
+            Some(value) => Some(value.clone()),
+            None => Some(json!(word)),
+        };
+        if let (Some(name), Some(range)) = (&self.time_range_argument, &options.time_range) {
+            if let Some(value) = mapped(&self.time_range_values, range) {
+                arguments.insert(name.clone(), value);
+                applied.push("time_range");
+            }
+        }
+        let mut language_used = false;
+        if let (Some(name), Some(code)) = (&self.language_argument, options.language_code()) {
+            arguments.insert(name.clone(), json!(code));
+            language_used = true;
+        }
+        if let (Some(name), Some(region)) = (&self.region_argument, options.region()) {
+            arguments.insert(name.clone(), json!(region));
+            language_used = true;
+        }
+        if language_used {
+            applied.push("language");
+        }
+        if let (Some(name), Some(level)) = (&self.safe_search_argument, &options.safe_search) {
+            if let Some(value) = mapped(&self.safe_search_values, level) {
+                arguments.insert(name.clone(), value);
+                applied.push("safe_search");
+            }
+        }
+        Ok((Value::Object(arguments), applied))
     }
 }
 
@@ -239,14 +439,15 @@ impl McpServerConfig {
         if let Some(search) = &self.web_search {
             search.validate()?;
         }
-        if self.enabled
-            && self.id == BRAVE_SEARCH_SERVER_ID
-            && self
-                .env
-                .get("BRAVE_API_KEY")
-                .is_none_or(|key| key.trim().is_empty())
-        {
-            bail!("Brave Search MCP is enabled but BRAVE_API_KEY is empty");
+        if let Some(preset) = search_preset(&self.id) {
+            if self.enabled
+                && self
+                    .env
+                    .get(preset.key_env)
+                    .is_none_or(|key| key.trim().is_empty())
+            {
+                bail!("{} MCP is enabled but {} is empty", preset.provider, preset.key_env);
+            }
         }
         crate::integrations::CommandSpec {
             program: self.program.clone(),
@@ -285,6 +486,92 @@ impl McpServerConfig {
                 max_query_chars: 400,
                 max_query_words: Some(50),
                 max_results: 10,
+                // Brave's own parameter names and values.
+                time_range_argument: Some("freshness".into()),
+                time_range_values: BTreeMap::from([
+                    ("day".into(), json!("pd")),
+                    ("week".into(), json!("pw")),
+                    ("month".into(), json!("pm")),
+                    ("year".into(), json!("py")),
+                ]),
+                language_argument: Some("search_lang".into()),
+                region_argument: Some("country".into()),
+                safe_search_argument: Some("safesearch".into()),
+                safe_search_values: BTreeMap::new(),
+                image_search: None,
+            }),
+        }
+    }
+
+    /// The preset with this ID, disabled and without a key.
+    pub fn search_preset(id: &str) -> Option<Self> {
+        match id {
+            BRAVE_SEARCH_SERVER_ID => Some(Self::brave_search_preset()),
+            EXA_SEARCH_SERVER_ID => Some(Self::exa_search_preset()),
+            KAGI_SEARCH_SERVER_ID => Some(Self::kagi_search_preset()),
+            _ => None,
+        }
+    }
+
+    /// Exa's official stdio MCP server (`web_search_exa`: query and numResults).
+    pub fn exa_search_preset() -> Self {
+        Self {
+            id: EXA_SEARCH_SERVER_ID.into(),
+            name: "Exa Search (official MCP)".into(),
+            program: "npx".into(),
+            args: vec!["-y".into(), EXA_SEARCH_PACKAGE.into()],
+            cwd: None,
+            env: BTreeMap::from([("EXA_API_KEY".into(), String::new())]),
+            enabled: false,
+            timeout_secs: 90,
+            web_search: Some(McpWebSearchConfig {
+                tool: "web_search_exa".into(),
+                query_argument: "query".into(),
+                limit_argument: Some("numResults".into()),
+                extra_arguments: BTreeMap::new(),
+                max_query_chars: 2_000,
+                max_query_words: None,
+                max_results: 10,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Kagi's official MCP server (`kagi_search_fetch`), run with uvx and asked
+    /// for JSON results. Kagi filters by day, week or month, not by year.
+    pub fn kagi_search_preset() -> Self {
+        Self {
+            id: KAGI_SEARCH_SERVER_ID.into(),
+            name: "Kagi Search (official MCP)".into(),
+            program: "uvx".into(),
+            args: vec![KAGI_SEARCH_PACKAGE.into()],
+            cwd: None,
+            env: BTreeMap::from([
+                ("KAGI_API_KEY".into(), String::new()),
+                ("KAGI_SEARCH_FORMAT".into(), "json".into()),
+            ]),
+            enabled: false,
+            timeout_secs: 90,
+            web_search: Some(McpWebSearchConfig {
+                tool: "kagi_search_fetch".into(),
+                query_argument: "query".into(),
+                limit_argument: Some("limit".into()),
+                extra_arguments: BTreeMap::new(),
+                max_query_chars: 1_000,
+                max_query_words: None,
+                max_results: 20,
+                time_range_argument: Some("time_relative".into()),
+                time_range_values: BTreeMap::from([
+                    ("day".into(), json!("day")),
+                    ("week".into(), json!("week")),
+                    ("month".into(), json!("month")),
+                    ("year".into(), Value::Null),
+                ]),
+                image_search: Some(McpImageSearchConfig {
+                    tool: None,
+                    extra_arguments: BTreeMap::from([("workflow".into(), json!("images"))]),
+                }),
+                ..Default::default()
             }),
         }
     }
@@ -875,6 +1162,96 @@ fn capture_stderr<R: Read>(mut pipe: R, output: Arc<Mutex<Vec<u8>>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exa_and_kagi_presets_build_their_providers_requests() {
+        let options = |range: &str| crate::integrations::SearchOptions { time_range: Some(range.into()), ..Default::default() };
+        let exa = McpServerConfig::exa_search_preset();
+        assert_eq!((exa.program.as_str(), exa.args.as_slice()), ("npx", &["-y".to_string(), EXA_SEARCH_PACKAGE.to_string()][..]));
+        let exa_search = exa.web_search.unwrap();
+        let (tool, arguments, applied) = exa_search.request("rust", 5, &options("week"), false).unwrap();
+        assert_eq!((tool.as_str(), arguments), ("web_search_exa", json!({"query":"rust","numResults":5})));
+        assert!(applied.is_empty(), "Exa's search tool has no date filter");
+        assert!(exa_search.request("fox", 5, &Default::default(), true).is_err(), "Exa is not set up for images");
+
+        let kagi = McpServerConfig::kagi_search_preset();
+        assert_eq!((kagi.program.as_str(), kagi.env.get("KAGI_SEARCH_FORMAT").map(String::as_str)), ("uvx", Some("json")));
+        let kagi_search = kagi.web_search.unwrap();
+        let (_, arguments, applied) = kagi_search.request("rust", 5, &options("week"), false).unwrap();
+        assert_eq!(arguments, json!({"query":"rust","limit":5,"time_relative":"week"}));
+        assert_eq!(applied, vec!["time_range"]);
+        // Kagi has no "year" filter: nothing is sent and the option is not applied.
+        let (_, arguments, applied) = kagi_search.request("rust", 5, &options("year"), false).unwrap();
+        assert_eq!(arguments, json!({"query":"rust","limit":5}));
+        assert!(applied.is_empty());
+        let (tool, arguments, _) = kagi_search.request("red fox", 4, &Default::default(), true).unwrap();
+        assert_eq!((tool.as_str(), arguments), ("kagi_search_fetch", json!({"query":"red fox","limit":4,"workflow":"images"})));
+    }
+
+    #[test]
+    fn every_preset_starts_disabled_and_needs_its_key_when_enabled() {
+        for preset in SEARCH_PRESETS {
+            let mut server = McpServerConfig::search_preset(preset.id).unwrap();
+            assert!(!server.enabled);
+            assert!(server.validate().is_ok(), "{}", preset.id);
+            assert_eq!(server.program, preset.launcher);
+            server.enabled = true;
+            let error = server.validate().unwrap_err().to_string();
+            assert!(error.contains(preset.key_env), "{error}");
+            server.env.insert(preset.key_env.into(), "key".into());
+            assert!(server.validate().is_ok());
+        }
+        assert!(McpServerConfig::search_preset("unknown").is_none());
+        let defaults: Vec<McpServerConfig> = serde_json::from_str(&crate::settings::Settings::default().mcp_json).unwrap();
+        assert_eq!(defaults.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec![BRAVE_SEARCH_SERVER_ID, EXA_SEARCH_SERVER_ID, KAGI_SEARCH_SERVER_ID]);
+        assert!(defaults.iter().all(|s| !s.enabled));
+    }
+
+    #[test]
+    fn brave_preset_maps_standard_options_to_brave_parameters() {
+        let mapping = McpServerConfig::brave_search_preset().web_search.unwrap();
+        let options = crate::integrations::SearchOptions {
+            time_range: Some("week".into()),
+            language: Some("en-GB".into()),
+            safe_search: Some("strict".into()),
+        };
+        let (arguments, applied) = mapping.arguments_with("rust", 5, &options).unwrap();
+        assert_eq!(
+            arguments,
+            json!({"query":"rust","count":5,"freshness":"pw","search_lang":"en","country":"GB","safesearch":"strict"})
+        );
+        assert_eq!(applied, vec!["time_range", "language", "safe_search"]);
+        // Without options the fixed default stays, and nothing is reported as applied.
+        let (arguments, applied) = mapping
+            .arguments_with("rust", 5, &crate::integrations::SearchOptions::default())
+            .unwrap();
+        assert_eq!(arguments, json!({"query":"rust","count":5,"safesearch":"moderate"}));
+        assert!(applied.is_empty());
+        assert_eq!(mapping.arguments("rust", 5).unwrap(), arguments);
+    }
+
+    #[test]
+    fn option_mappings_cannot_replace_the_query_or_use_unknown_values() {
+        let base = McpWebSearchConfig { tool: "search".into(), ..Default::default() };
+        let replaces_query = McpWebSearchConfig { time_range_argument: Some("query".into()), ..base.clone() };
+        assert!(replaces_query.validate().is_err());
+        let replaces_limit = McpWebSearchConfig { safe_search_argument: Some("count".into()), ..base.clone() };
+        assert!(replaces_limit.validate().is_err());
+        let unknown = McpWebSearchConfig {
+            time_range_argument: Some("recency".into()),
+            time_range_values: BTreeMap::from([("fortnight".into(), json!("2w"))]),
+            ..base.clone()
+        };
+        assert!(unknown.validate().is_err());
+        // An unmapped option is simply not applied.
+        let options = crate::integrations::SearchOptions { time_range: Some("day".into()), ..Default::default() };
+        let (arguments, applied) = base.arguments_with("q", 3, &options).unwrap();
+        assert_eq!(arguments, json!({"query":"q","count":3}));
+        assert!(applied.is_empty());
+        // Older saved mappings without the new fields still load.
+        let legacy: McpWebSearchConfig = serde_json::from_value(json!({"tool":"search","query_argument":"q"})).unwrap();
+        assert!(legacy.time_range_argument.is_none() && legacy.validate().is_ok());
+    }
 
     #[test]
     #[cfg(unix)]

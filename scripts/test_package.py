@@ -451,7 +451,12 @@ class SourceIntegrity(unittest.TestCase):
         self.assertIn('explicit_web_search_intent', runtime)
         self.assertIn('workspace_tools_enabled', tools)
         self.assertIn('Web search', diagnostics)
-        self.assertIn('BRAVE_API_KEY', preferences)
+        # The Settings page shows an API-key field for every search preset
+        # (Brave, Exa, Kagi); each preset names its key variable.
+        self.assertIn('SEARCH_PRESETS', preferences)
+        self.assertIn('preset.key_env', preferences)
+        for key in ('BRAVE_API_KEY', 'EXA_API_KEY', 'KAGI_API_KEY'):
+            self.assertIn(key, mcp)
         self.assertIn('TOOL_CAPABILITY_SYSTEM', settings)
 
     def test_rc8_restricted_engine_names_borrow_from_live_definitions(self):

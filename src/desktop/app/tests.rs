@@ -678,6 +678,8 @@ fn auto_approval_answers_only_the_enabled_kinds_and_records_each_one() {
         limit: 5,
         fallbacks: vec![],
         local_sites: None,
+        options: Default::default(),
+        images: false,
     };
     let delete = crate::tools::Operation::Delete {
         path: "a.txt".into(),
@@ -1418,4 +1420,32 @@ fn formulas_in_answers_are_shown_as_readable_math() {
     frame(&mut app, &ctx, size, vec![]);
     let output = frame(&mut app, &ctx, size, vec![]);
     visible_label(&output, "The area is π r² and it costs $5 and $10.", size);
+}
+
+#[test]
+fn related_searches_from_the_latest_turn_are_offered_under_the_answer() {
+    let (_dir, ctx, mut app) = fixture();
+    let size = [1366.0, 768.0];
+    app.page = Page::Chat;
+    let tool = |content: Value| {
+        let mut entry = Entry::new(ChatMessage { role: "tool".into(), content: content.to_string(), ..Default::default() });
+        entry.message.tool_name = Some("web_search".into());
+        entry
+    };
+    app.session.entries = vec![
+        Entry::new(ChatMessage { role: "user".into(), content: "old".into(), ..Default::default() }),
+        tool(json!({"suggestions":["stale suggestion"]})),
+        Entry::new(ChatMessage { role: "user".into(), content: "red fox".into(), ..Default::default() }),
+        tool(json!({"suggestions":["red fox habitat","Red Fox Habitat","arctic fox"]})),
+        tool(json!({"results":[]})),
+        Entry::new(ChatMessage { role: "assistant".into(), content: "Foxes are canids.".into(), ..Default::default() }),
+    ];
+    assert_eq!(chat::related_searches(&app.session.entries), vec!["red fox habitat", "arctic fox"]);
+    frame(&mut app, &ctx, size, vec![]);
+    let output = frame(&mut app, &ctx, size, vec![]);
+    let chip = visible_label(&output, "arctic fox", size).center();
+    visible_label(&output, "Related searches:", size);
+    frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(chip), click(chip, true)]);
+    frame(&mut app, &ctx, size, vec![click(chip, false)]);
+    assert_eq!(app.input, "Search the web for arctic fox");
 }

@@ -13,6 +13,7 @@ pub fn configured_engine(
     engine.set_check_mode(crate::tools::CheckMode::parse(&settings.check_after_edits)?);
     engine.set_network_enabled(settings.network_tools);
     engine.set_knowledge_search(settings.knowledge_search);
+    engine.set_search_depth(&settings.search_depth);
     if settings.network_tools && !settings.searxng_url.trim().is_empty() {
         engine.set_search_url(Some(settings.searxng_url.clone()))?;
     }
@@ -84,6 +85,7 @@ pub fn configured_network_engine(settings: &Settings, root: PathBuf) -> Result<T
     engine.set_workspace_tools_enabled(false);
     engine.set_network_enabled(settings.network_tools);
     engine.set_knowledge_search(settings.knowledge_search);
+    engine.set_search_depth(&settings.search_depth);
     if settings.network_tools && !settings.searxng_url.trim().is_empty() {
         engine.set_search_url(Some(settings.searxng_url.clone()))?;
     }

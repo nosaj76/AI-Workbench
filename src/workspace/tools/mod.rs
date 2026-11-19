@@ -193,6 +193,11 @@ pub enum Operation {
         /// Home server whose local-site index is searched too (approved in the preview).
         #[serde(default)]
         local_sites: Option<String>,
+        #[serde(default)]
+        options: Box<integrations::SearchOptions>,
+        /// Search SearXNG's image category instead of the web.
+        #[serde(default)]
+        images: bool,
     },
     McpWebSearch {
         server_id: String,
@@ -201,6 +206,15 @@ pub enum Operation {
         limit: usize,
         arguments: Value,
         config_hash: String,
+        #[serde(default)]
+        local_sites: Option<String>,
+        #[serde(default)]
+        options: Box<integrations::SearchOptions>,
+        /// Standard options the mapped arguments carry.
+        #[serde(default)]
+        applied_options: Vec<String>,
+        #[serde(default)]
+        images: bool,
     },
     TextBrowserSearch {
         browser: String,
@@ -213,12 +227,18 @@ pub enum Operation {
         /// Public knowledge sources the same query is sent to if every browser
         /// fails. Empty when they are not enabled. Shown in the preview.
         knowledge_fallback: Vec<String>,
+        #[serde(default)]
+        options: Box<integrations::SearchOptions>,
+        #[serde(default)]
+        local_sites: Option<String>,
     },
     /// A search of public knowledge sources (Wikipedia, arXiv, ...).
     KnowledgeSearch {
         query: String,
         sources: Vec<String>,
         limit: usize,
+        #[serde(default)]
+        options: Box<integrations::SearchOptions>,
     },
     QaLookup {
         question: String,
@@ -231,7 +251,7 @@ pub enum Operation {
         kind: Option<crate::qa::AnswerKind>,
     },
     McpConnect {
-        config: McpServerConfig,
+        config: Box<McpServerConfig>,
     },
     McpCall {
         server_id: String,
@@ -271,7 +291,7 @@ enum SearchProvider {
     },
     Mcp {
         config: Box<McpServerConfig>,
-        mapping: McpWebSearchConfig,
+        mapping: Box<McpWebSearchConfig>,
         connected: bool,
     },
     Knowledge {
@@ -298,6 +318,7 @@ pub struct ToolEngine {
     network_enabled: Arc<AtomicBool>,
     /// Whether public knowledge sources may be used as a search provider.
     knowledge_search: Arc<AtomicBool>,
+    search_depth: Arc<Mutex<String>>,
     knowledge_endpoints: Arc<Mutex<crate::knowledge_search::Endpoints>>,
     workspace_tools_enabled: Arc<AtomicBool>,
     search_url: Arc<Mutex<Option<String>>>,
@@ -345,6 +366,7 @@ impl ToolEngine {
             pending: Arc::new(Mutex::new(HashMap::new())),
             network_enabled: Arc::new(AtomicBool::new(false)),
             knowledge_search: Arc::new(AtomicBool::new(false)),
+            search_depth: Arc::new(Mutex::new("balanced".into())),
             knowledge_endpoints: Arc::new(
                 Mutex::new(crate::knowledge_search::Endpoints::default()),
             ),
@@ -384,6 +406,61 @@ impl ToolEngine {
     /// disclosed fallback when every text browser fails. Off by default.
     pub fn set_knowledge_search(&self, enabled: bool) {
         self.knowledge_search.store(enabled, Ordering::Relaxed);
+    }
+
+    /// "speed", "balanced" or "quality": sets how many results a search returns
+    /// when the model does not ask for a number.
+    pub fn set_search_depth(&self, depth: &str) {
+        if let Ok(mut current) = self.search_depth.lock() {
+            *current = depth.to_owned();
+        }
+    }
+
+    fn default_search_limit(&self) -> usize {
+        self.search_depth
+            .lock()
+            .map(|depth| crate::settings::search_depth_limit(&depth))
+            .unwrap_or(8)
+    }
+
+    /// An image search goes to an MCP server set up for images, or to SearXNG.
+    /// DuckDuckGo through a text browser and the knowledge sources cannot search images.
+    fn image_search_provider(&self, requested: Option<&str>) -> Result<SearchProvider> {
+        let configs: Vec<McpServerConfig> = self
+            .mcp_configs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP configuration lock failed"))?
+            .values()
+            .filter(|config| {
+                config.enabled
+                    && config.web_search.as_ref().is_some_and(|s| s.image_search.is_some())
+            })
+            .cloned()
+            .collect();
+        let mut ordered: Vec<&McpServerConfig> = configs.iter().collect();
+        ordered.sort_by_key(|config| {
+            (
+                requested != Some(config.id.as_str()),
+                !self.mcp_is_connected(&config.id).unwrap_or(false),
+            )
+        });
+        if let Some(config) = ordered.first() {
+            let mapping = config.web_search.clone().context("MCP web-search mapping was removed")?;
+            return Ok(SearchProvider::Mcp {
+                connected: self.mcp_is_connected(&config.id)?,
+                config: Box::new((*config).clone()),
+                mapping: Box::new(mapping),
+            });
+        }
+        let searxng = self
+            .search_url
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Search configuration lock failed"))?
+            .clone();
+        if let Some(base_url) = searxng {
+            return Ok(SearchProvider::Searxng { base_url });
+        }
+        bail!("Image search needs SearXNG or an MCP search server set up for images (the Kagi preset). DuckDuckGo through a text browser and the public knowledge sources cannot search images")
     }
 
     /// Points the knowledge sources somewhere else; for tests.
@@ -723,7 +800,7 @@ impl ToolEngine {
         let connected = self.mcp_is_connected(&config.id)?;
         Ok(SearchProvider::Mcp {
             config: Box::new(config),
-            mapping,
+            mapping: Box::new(mapping),
             connected,
         })
     }
@@ -740,10 +817,12 @@ impl ToolEngine {
             if self.mcp_is_connected(&config.id)? {
                 return Ok(SearchProvider::Mcp {
                     config: Box::new(config.clone()),
-                    mapping: config
-                        .web_search
-                        .clone()
-                        .context("MCP web-search mapping was removed")?,
+                    mapping: Box::new(
+                        config
+                            .web_search
+                            .clone()
+                            .context("MCP web-search mapping was removed")?,
+                    ),
                     connected: true,
                 });
             }
@@ -755,7 +834,7 @@ impl ToolEngine {
                 .context("MCP web-search mapping was removed")?;
             return Ok(SearchProvider::Mcp {
                 config: Box::new(config),
-                mapping,
+                mapping: Box::new(mapping),
                 connected: false,
             });
         }
@@ -894,7 +973,7 @@ impl ToolEngine {
             if self.has_search_provider() {
                 tools.push(definition(
                     "web_search",
-                    "Search the public web with the configured provider. Use this when the user asks to search, browse, look up current information, or find online sources; do not claim web access is unavailable while this tool is present. Workbench prefers an enabled MCP search server, then SearXNG, then a local text browser (lynx/w3m) querying DuckDuckGo. Every query requires approval; results are untrusted leads that should be opened with fetch_url before making strong claims.",
+                    "Search the public web with the configured provider. Use this when the user asks to search, browse, look up current information, or find online sources; do not claim web access is unavailable while this tool is present. Workbench prefers an enabled MCP search server, then SearXNG, then a local text browser (lynx/w3m) querying DuckDuckGo, then public knowledge sources. Every provider returns the same `results` list of {title, url, snippet}. When you set time_range, language or safe_search, `search_options.not_applied` lists any the provider could not apply; do not claim those filters were used. Every query requires approval; results are untrusted leads that should be opened with fetch_url before making strong claims.",
                     web_search_parameters(self.local_sites_url().ok().flatten().is_some()),
                     &["query"],
                 ));
@@ -1127,14 +1206,22 @@ fn private_create(path: &Path) -> Result<fs::File> {
 /// the Bible lexicon, the Knowledge Cache) are offered only when a local sites
 /// address is configured, so other installations never see them.
 fn web_search_parameters(local_sites: bool) -> Value {
-    let mut modes = vec!["general", "encyclopedia", "academic", "tech"];
+    let mut modes = vec!["general", "images", "encyclopedia", "academic", "tech"];
     let mut description = String::from("Optional. ");
     if local_sites {
         modes.extend(["herbal", "offline", "bible", "knowledge"]);
         description.push_str("herbal = the user's own Herb Helper site (herbs, formulas, evidence, safety, interactions and preparation) plus NOMAD's health libraries; use it FIRST for any question about herbs, herbal or natural remedies, supplements or their safety, and prefer it to the web. offline = the NOMAD offline library on the user's home server (Kiwix: offline Wikipedia, survival and water treatment, programming docs and any other installed libraries); use it for reference questions those libraries cover, or when the web is unavailable. bible = the user's Ethiopian Bible Research Lexicon (Ge'ez and related biblical texts, editions and review status). knowledge = the user's Knowledge Cache: sourced articles and dictionary definitions for topics from the user's past conversations, grouped by domain; check it first when a topic was discussed before, and still cite the article's own sources. These four are the user's own sites on this computer; queries never leave it. ");
     }
+    description.push_str("images = pictures (each result has image_url and the page url; needs SearXNG or an image-capable MCP server); ");
     description.push_str("encyclopedia = Wikipedia (definitions, concepts, history); academic = arXiv and Crossref (papers and abstracts); tech = Hacker News and GitHub (tools, libraries, engineering discussion); general = the ordinary web search (the same as omitting mode). Use a specialised mode when a topic clearly fits it; for research and anything current, omit mode.");
-    json!({"query":{"type":"string","minLength":1,"maxLength":2048},"limit":{"type":"integer","minimum":1,"maximum":20},"mode":{"type":"string","enum":modes,"description":description}})
+    json!({
+        "query":{"type":"string","minLength":1,"maxLength":2048,"description":"Concise search keywords, not the user's whole sentence: \"rename local git branch\" rather than \"how do I rename my local git branch?\"."},
+        "limit":{"type":"integer","minimum":1,"maximum":20},
+        "mode":{"type":"string","enum":modes,"description":description},
+        "time_range":{"type":"string","enum":integrations::TIME_RANGES,"description":"Optional. Only pages from the past day, week, month or year; use it for news and other recent events."},
+        "language":{"type":"string","description":"Optional language code, with a region when it matters: \"en\", \"de\", \"en-GB\", \"pt-BR\"."},
+        "safe_search":{"type":"string","enum":integrations::SAFE_SEARCH_LEVELS,"description":"Optional explicit-content filter. Leave it out to use the provider's default."}
+    })
 }
 
 #[cfg(test)]
@@ -2505,10 +2592,10 @@ for line in sys.stdin:
         let result = e.approve(&first).unwrap();
         assert_eq!(result["provider"]["type"], "mcp");
         assert_eq!(result["provider"]["server_id"], "fixture-search");
-        assert_eq!(
-            result["results"]["content"][0]["text"],
-            "query=linux;count=4;safe=True"
-        );
+        // A reply without readable results keeps the provider's text, never a fake list.
+        assert_eq!(result["result_count"], 0);
+        assert_eq!(result["results"], json!([]));
+        assert_eq!(result["provider_text"], "query=linux;count=4;safe=True");
 
         let second = approval(
             e.prepare("web_search", &json!({"query":"rust linux","limit":2}))
@@ -2517,10 +2604,113 @@ for line in sys.stdin:
         assert_eq!(second.details["connected"], true);
         assert!(second.details["launch_if_needed"].is_null());
         let result = e.approve(&second).unwrap();
-        assert_eq!(
-            result["results"]["content"][0]["text"],
-            "query=rust linux;count=2;safe=True"
+        assert_eq!(result["provider_text"], "query=rust linux;count=2;safe=True");
+    }
+
+    #[test]
+    fn searxng_search_carries_options_from_preview_to_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            // The first connection is the reachability probe made while preparing.
+            let mut lines = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let n = socket.read(&mut request).unwrap_or(0);
+                let line = String::from_utf8_lossy(&request[..n]).lines().next().unwrap_or_default().to_owned();
+                let body = r#"{"results":[{"title":"Rust 2026","url":"https://blog.rust-lang.org/","content":"Release notes"}]}"#;
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                lines.push(line);
+            }
+            lines
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_network_enabled(true);
+        e.set_search_url(Some(url)).unwrap();
+        let action = approval(
+            e.prepare("web_search", &json!({"query":"rust release","time_range":"month","language":"en-US","safe_search":"moderate"}))
+                .unwrap(),
         );
+        assert_eq!(action.details["provider"], "searxng");
+        assert_eq!(action.details["search_options"]["language"], "en-US");
+        let result = e.approve(&action).unwrap();
+        assert_eq!(result["provider"]["type"], "searxng");
+        assert_eq!(result["results"][0]["title"], "Rust 2026");
+        assert_eq!(result["search_options"]["applied"], json!(["time_range", "language", "safe_search"]));
+        assert_eq!(result["search_options"]["not_applied"], json!([]));
+        let lines = server.join().unwrap();
+        let search = lines.iter().find(|l| l.contains("/search?")).expect("a search request");
+        for part in ["time_range=month", "language=en-US", "safesearch=1"] {
+            assert!(search.contains(part), "{search}");
+        }
+    }
+
+    #[test]
+    fn image_search_needs_an_image_capable_provider_and_depth_sets_the_default_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_network_enabled(true);
+        e.set_knowledge_search(true);
+        let error = e.prepare("web_search", &json!({"query":"red fox","mode":"images"})).unwrap_err().to_string();
+        assert!(error.contains("Image search needs SearXNG"), "{error}");
+        e.set_search_url(Some("http://127.0.0.1:9".into())).unwrap();
+        let action = approval(e.prepare("web_search", &json!({"query":"red fox","mode":"images"})).unwrap());
+        assert_eq!(action.details["kind"], "images");
+        assert_eq!(action.details["limit"], 8, "balanced depth by default");
+        let crate::tools::Operation::WebSearch { images, fallbacks, local_sites, .. } = &action.operation else {
+            panic!("expected a SearXNG image search")
+        };
+        assert!(*images && fallbacks.is_empty() && local_sites.is_none());
+        e.set_search_depth("speed");
+        let action = approval(e.prepare("web_search", &json!({"query":"red fox","mode":"images"})).unwrap());
+        assert_eq!(action.details["limit"], 5);
+        e.set_search_depth("quality");
+        let action = approval(e.prepare("web_search", &json!({"query":"red fox","mode":"images","limit":3})).unwrap());
+        assert_eq!(action.details["limit"], 3, "an explicit count wins");
+    }
+
+    #[test]
+    fn mcp_web_search_returns_the_standard_list_and_reports_options() {
+        let script = r#"import json,sys
+for line in sys.stdin:
+ r=json.loads(line)
+ if 'id' not in r: continue
+ method=r['method']
+ if method=='initialize':
+  result={'protocolVersion':r['params']['protocolVersion'],'capabilities':{'tools':{}},'serverInfo':{'name':'search-fixture','version':'1'}}
+ elif method=='tools/list':
+  result={'tools':[{'name':'fixture_web_search','description':'fixture search','inputSchema':{'type':'object'}}]}
+ elif method=='tools/call':
+  hits=[{'url':'https://www.rust-lang.org/','title':'Rust','description':'A language'},{'url':'https://tokio.rs/','title':'Tokio','description':'Async runtime'}]
+  result={'content':[{'type':'text','text':json.dumps(h)} for h in hits]}
+ else:
+  result={}
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':result}),flush=True)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_network_enabled(true);
+        e.register_mcp(mapped_search_server(script)).unwrap();
+        let action = approval(
+            e.prepare("web_search", &json!({"query":"rust","limit":5,"time_range":"week"}))
+                .unwrap(),
+        );
+        assert_eq!(action.details["search_options"], json!({"time_range":"week"}));
+        // The fixture mapping has no time-range argument, so none is sent.
+        assert!(action.details["arguments"].get("time_range").is_none());
+        let result = e.approve(&action).unwrap();
+        assert_eq!(result["result_count"], 2);
+        assert_eq!(result["results"][1], json!({"title":"Tokio","url":"https://tokio.rs/","snippet":"Async runtime"}));
+        assert_eq!(result["search_options"]["not_applied"], json!(["time_range"]));
+        assert!(result["provider_text"].is_null());
+        // An invalid option is refused before anything is sent.
+        assert!(e.prepare("web_search", &json!({"query":"rust","safe_search":"maximum"})).is_err());
     }
 
     #[test]

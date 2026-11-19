@@ -256,6 +256,18 @@ impl Workbench {
                     changed |= ui
                         .checkbox(&mut self.settings.agents_enabled, "Agents")
                         .changed();
+                    ui.separator();
+                    ui.label(RichText::new("Web search depth").small().strong());
+                    for (value, label) in crate::settings::SEARCH_DEPTHS {
+                        changed |= ui
+                            .radio_value(&mut self.settings.search_depth, value.to_string(), label)
+                            .on_hover_text(match value {
+                                "speed" => "One search; answer from result snippets",
+                                "quality" => "Several searches; read and compare four or more sources",
+                                _ => "One or two searches; read the two or three best pages",
+                            })
+                            .changed();
+                    }
                 });
             });
             if changed {
@@ -539,6 +551,8 @@ impl Workbench {
         let mut inspect = None;
         let mut code_to_export = None;
         let mut feedback: Option<(String, &'static str)> = None;
+        let mut related_click: Option<String> = None;
+        let related = related_searches(&self.session.entries);
         let mut show_more = false;
         egui::ScrollArea::vertical().id_salt("transcript")
             .stick_to_bottom(true)
@@ -712,6 +726,19 @@ impl Workbench {
                                 if !entry.message.images.is_empty() {
                                     ui.label(RichText::new(format!("{} attached image(s)", entry.message.images.len())).small());
                                 }
+                                if Some(index) == last_message && !user && self.streaming != Some(index) && !related.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new("Related searches:").small().color(ui.visuals().weak_text_color()));
+                                        for suggestion in &related {
+                                            if ui.small_button(suggestion)
+                                                .on_hover_text("Put this search in the message box")
+                                                .clicked() {
+                                                related_click = Some(suggestion.clone());
+                                            }
+                                        }
+                                    });
+                                }
                             });
                         let hovered = ui.rect_contains_pointer(card.response.rect);
                         let was_hovered = ui.ctx().data_mut(|d| {
@@ -738,6 +765,9 @@ impl Workbench {
         }
         if let Some((id, value)) = feedback {
             self.set_feedback(&id, value);
+        }
+        if let Some(suggestion) = related_click {
+            self.input = format!("Search the web for {suggestion}");
         }
         if let Some(index) = branch {
             self.code_export_preview = None;
@@ -809,6 +839,28 @@ impl Workbench {
             Err(error) => self.error = Some(format!("Cannot prepare code export: {error:#}")),
         }
     }
+}
+
+/// Related searches suggested by the web searches of the latest turn, at most six.
+pub(super) fn related_searches(entries: &[Entry]) -> Vec<String> {
+    let start = entries.iter().rposition(|e| e.message.role == "user").map_or(0, |i| i + 1);
+    let mut out: Vec<String> = Vec::new();
+    for entry in &entries[start..] {
+        if entry.message.role != "tool" || entry.message.tool_name.as_deref() != Some("web_search") {
+            continue;
+        }
+        let Ok(result) = serde_json::from_str::<Value>(&entry.message.content) else {
+            continue;
+        };
+        for suggestion in result.get("suggestions").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(text) = suggestion.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                if out.len() < 6 && !out.iter().any(|o| o.eq_ignore_ascii_case(text)) {
+                    out.push(text.to_owned());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The saved rating of an answer: "up", "down" or none.

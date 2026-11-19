@@ -92,9 +92,10 @@ impl ResearchRequest {
         if self.web_enabled
             && self.settings.searxng_url.trim().is_empty()
             && integrations::resolve_text_browser(&self.settings.text_browser).is_none()
+            && !self.settings.knowledge_search
             && self.seed_urls.is_empty()
         {
-            bail!("Web research requires a configured SearxNG endpoint, an installed text browser (lynx, w3m, elinks or links), or explicit source URLs");
+            bail!("Web research requires a configured SearxNG endpoint, an installed text browser (lynx, w3m, elinks or links), public knowledge sources, or explicit source URLs");
         }
         if self.seed_urls.len() > 100 || self.allowed_domains.len() > 100 {
             bail!("Too many research source URLs or domain restrictions");
@@ -436,27 +437,21 @@ fn execute(
                 }
                 persist(&request.data_dir, state)?;
             }
-            let text_browser = if request.settings.searxng_url.trim().is_empty() {
-                integrations::resolve_text_browser(&request.settings.text_browser)
-            } else {
-                None
-            };
             if request.web_enabled
-                && (!request.settings.searxng_url.trim().is_empty() || text_browser.is_some())
+                && has_web_search(&request.settings)
                 && state.sources.len() < request.max_sources
             {
                 agents::status(tx, &format!("Web research query: {query}"));
-                let searched = match &text_browser {
-                    Some(browser) => integrations::search_text_browser(
-                        browser,
-                        &query,
-                        8,
-                        &request.data_dir,
-                        Some(cancel.clone()),
-                    ),
-                    None => integrations::search_searxng(&request.settings.searxng_url, &query, 8),
-                };
-                match searched {
+                let searched = research_web_search(request, &query, &cancel);
+                if let Ok((_, skipped)) = &searched {
+                    if !skipped.is_empty() {
+                        add_warning(
+                            state,
+                            format!("Search for \"{query}\" fell back after: {}", skipped.join("; ")),
+                        );
+                    }
+                }
+                match searched.map(|(hits, _)| hits) {
                     Ok(hits) => {
                         state.queries.push(ResearchQuery {
                             round: round + 1,
@@ -940,6 +935,59 @@ fn markdown_text(text: &str) -> String {
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+/// Deep Research can search the web with at least one provider.
+fn has_web_search(settings: &crate::settings::Settings) -> bool {
+    !settings.searxng_url.trim().is_empty()
+        || integrations::resolve_text_browser(&settings.text_browser).is_some()
+        || settings.knowledge_search
+}
+
+/// The same order as chat: SearXNG, then the text browser (DuckDuckGo), then
+/// public knowledge sources (Wikipedia, arXiv, Crossref), each tried when the
+/// one before is not set up or fails. Returns the hits and the failures skipped.
+fn research_web_search(
+    request: &ResearchRequest,
+    query: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(Vec<integrations::SearchResult>, Vec<String>)> {
+    let settings = &request.settings;
+    let mut failures = Vec::new();
+    if !settings.searxng_url.trim().is_empty() {
+        match integrations::search_searxng(&settings.searxng_url, query, 8) {
+            Ok(hits) => return Ok((hits, failures)),
+            Err(error) => failures.push(format!("SearXNG: {error:#}")),
+        }
+    }
+    agents::check_cancel(cancel)?;
+    if let Some(browser) = integrations::resolve_text_browser(&settings.text_browser) {
+        match integrations::search_text_browser(&browser, query, 8, &request.data_dir, Some(cancel.clone())) {
+            Ok(hits) => return Ok((hits, failures)),
+            Err(error) => failures.push(format!("{}: {error:#}", browser.name)),
+        }
+    }
+    agents::check_cancel(cancel)?;
+    if settings.knowledge_search {
+        let sources: Vec<String> = ["wikipedia", "arxiv", "crossref"].map(String::from).to_vec();
+        let found = crate::knowledge_search::Endpoints::for_local_sites(&settings.local_sites_url)
+            .and_then(|endpoints| crate::knowledge_search::search(&endpoints, query, &sources, 8));
+        match found {
+            Ok(found) => {
+                let hits = found
+                    .results
+                    .into_iter()
+                    .map(|r| integrations::SearchResult { title: r.title, url: r.url, snippet: r.snippet, ..Default::default() })
+                    .collect();
+                return Ok((hits, failures));
+            }
+            Err(error) => failures.push(format!("public knowledge sources: {error:#}")),
+        }
+    }
+    if failures.is_empty() {
+        bail!("No web search provider is set up");
+    }
+    bail!("Every web search provider failed: {}", failures.join("; "))
+}
+
 fn add_warning(run: &mut ResearchRun, warning: String) {
     if run.warnings.len() < 200 && !run.warnings.contains(&warning) {
         run.warnings.push(warning);
@@ -1009,6 +1057,55 @@ pub fn list_runs(data_dir: &Path, limit: usize) -> Result<Vec<ResearchRun>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn web_request(searxng_url: &str, knowledge: bool) -> ResearchRequest {
+        let settings = Settings {
+            searxng_url: searxng_url.into(),
+            text_browser: "none".into(),
+            knowledge_search: knowledge,
+            ..Default::default()
+        };
+        let dir = std::env::temp_dir();
+        ResearchRequest::new(settings, None, dir, "q".into(), "m".into())
+    }
+
+    #[test]
+    fn deep_research_search_reports_every_provider_it_tried() {
+        // Nothing set up.
+        let none = web_request("", false);
+        assert!(!has_web_search(&none.settings));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let error = research_web_search(&none, "rust", &cancel).unwrap_err().to_string();
+        assert!(error.contains("No web search provider"), "{error}");
+        // Public knowledge sources alone count as a provider.
+        assert!(has_web_search(&web_request("", true).settings));
+        // A SearXNG that is not running is reported, not hidden.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let down = web_request(&url, false);
+        let error = research_web_search(&down, "rust", &cancel).unwrap_err().to_string();
+        assert!(error.contains("Every web search provider failed") && error.contains("SearXNG"), "{error}");
+    }
+
+    #[test]
+    fn deep_research_uses_searxng_results_when_it_answers() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request);
+            let body = r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/","content":"A language"}]}"#;
+            let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let request = web_request(&url, true);
+        let (hits, skipped) = research_web_search(&request, "rust", &Arc::new(AtomicBool::new(false))).unwrap();
+        server.join().unwrap();
+        assert_eq!(hits[0].url, "https://www.rust-lang.org/");
+        assert!(skipped.is_empty());
+    }
     #[test]
     fn research_plans_are_bounded_and_queries_are_deduplicated() {
         let plan = parse_plan(r#"{"queries":[" Rust FTS5 ","rust fts5"],"done":false}"#).unwrap();

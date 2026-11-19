@@ -497,7 +497,7 @@ impl ToolEngine {
                 if query.chars().count() > 2_048 {
                     bail!("Web-search query exceeds 2,048 characters");
                 }
-                let limit = uint(args, "limit", 10, 1, 20);
+                let limit = uint(args, "limit", self.default_search_limit(), 1, 20);
                 let requested_provider = args
                     .get("provider")
                     .map(|value| {
@@ -511,10 +511,14 @@ impl ToolEngine {
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|m| !m.is_empty());
+                let options = Box::new(integrations::SearchOptions::from_args(args)?);
+                let options_preview = (!options.is_empty()).then(|| json!(&*options));
                 // "general" is the ordinary web search: it used to send research
                 // questions to Wikipedia and Hacker News only, skipping the real
                 // web provider. The specialised modes still pick their sources.
+                let images = mode == Some("images");
                 let provider = match mode {
+                    Some("images") => self.image_search_provider(requested_provider)?,
                     Some(mode) if mode != "general" => self.knowledge_provider(mode)?,
                     _ => self.search_provider(requested_provider)?,
                 };
@@ -543,14 +547,29 @@ impl ToolEngine {
                                     labels.join(" and ")
                                 )
                             },
-                            json!({"query":query,"limit":limit,"provider":"knowledge","sources":labels,"hosts":hosts}),
+                            json!({"query":query,"limit":limit,"provider":"knowledge","sources":labels,"hosts":hosts,"search_options":options_preview,"options_note":(!options.is_empty()).then_some("These sources cannot apply time_range, language or safe_search; the result will say so.")}),
                             Operation::KnowledgeSearch {
                                 query,
                                 sources,
                                 limit,
+                                options,
                             },
                         )
                     }
+                    SearchProvider::Searxng { base_url } if images => (
+                        "Search for images".into(),
+                        "Send this query to the configured SearXNG instance's image search and the image engines it uses. Only image results are returned; nothing else is sent or executed.".into(),
+                        json!({"query":query,"provider":"searxng","kind":"images","server":base_url,"limit":limit,"search_options":options_preview}),
+                        Operation::WebSearch {
+                            query,
+                            base_url,
+                            limit,
+                            fallbacks: Vec::new(),
+                            local_sites: None,
+                            options,
+                            images: true,
+                        },
+                    ),
                     SearchProvider::Searxng { base_url } => {
                         let fallbacks: Vec<(String, String)> = self
                             .text_browser_fallback_candidates()?
@@ -573,18 +592,20 @@ impl ToolEngine {
                         (
                             "Search your sites and the web".into(),
                             format!("Send this query to the configured SearXNG instance and the search providers it uses.{retry}{local_note}"),
-                            json!({"query":query,"provider":"searxng","server":base_url,"limit":limit,"fallback_browsers":names,"local_sites":local_sites}),
+                            json!({"query":query,"provider":"searxng","server":base_url,"limit":limit,"fallback_browsers":names,"local_sites":local_sites,"search_options":options_preview}),
                             Operation::WebSearch {
                                 query,
                                 base_url,
                                 limit,
                                 fallbacks,
                                 local_sites,
+                                options,
+                                images: false,
                             },
                         )
                     }
                     SearchProvider::TextBrowser { browser } => {
-                        let spec = integrations::text_browser_search_command(&browser, &query)?;
+                        let spec = integrations::text_browser_search_command_with(&browser, &query, &options)?;
                         let fallbacks: Vec<(String, String)> = self
                             .text_browser_fallback_candidates()?
                             .into_iter()
@@ -619,6 +640,10 @@ impl ToolEngine {
                                 knowledge_labels.join(" and ")
                             ));
                         }
+                        let local_sites = self.local_sites_url()?;
+                        if let Some(url) = &local_sites {
+                            retry_note.push_str(&format!(" Your own sites are searched too, from the index at {url}; that part stays on your network."));
+                        }
                         (
                             format!("Search the web with {}", browser.name),
                             format!("Run {} to fetch DuckDuckGo's HTML results page for exactly this query. The query is sent to DuckDuckGo; no shell is used and nothing else is executed.{retry_note}", browser.name),
@@ -631,6 +656,8 @@ impl ToolEngine {
                                 "fallback_knowledge_sources":knowledge_labels,
                                 "search_engine":"DuckDuckGo (html.duckduckgo.com)",
                                 "command":std::iter::once(spec.program.clone()).chain(spec.args.iter().cloned()).collect::<Vec<_>>(),
+                                "search_options":options_preview,
+                                "local_sites":local_sites,
                             }),
                             Operation::TextBrowserSearch {
                                 browser: browser.name,
@@ -639,6 +666,8 @@ impl ToolEngine {
                                 limit,
                                 fallbacks,
                                 knowledge_fallback,
+                                options,
+                                local_sites,
                             },
                         )
                     }
@@ -647,14 +676,15 @@ impl ToolEngine {
                         mapping,
                         connected,
                     } => {
-                        let arguments = mapping.arguments(&query, limit)?;
+                        let (tool, arguments, applied) = mapping.request(&query, limit, &options, images)?;
+                        let local_sites = if images { None } else { self.local_sites_url()? };
                         let config_hash = hash(&serde_json::to_vec(&config)?);
                         let cwd = config.cwd.as_deref().unwrap_or(self.root());
                         let first_launch_may_download = !connected
                             && Path::new(&config.program)
                                 .file_name()
                                 .and_then(|name| name.to_str())
-                                .is_some_and(|name| name == "npx");
+                                .is_some_and(|name| name == "npx" || name == "uvx");
                         let details = json!({
                             "query":query,
                             "limit":limit,
@@ -662,7 +692,8 @@ impl ToolEngine {
                             "server_id":config.id,
                             "server_name":config.name,
                             "connected":connected,
-                            "tool":mapping.tool,
+                            "tool":tool,
+                            "kind":if images { "images" } else { "web" },
                             "arguments":arguments,
                             "launch_if_needed":if connected { Value::Null } else {
                                 json!({
@@ -673,18 +704,27 @@ impl ToolEngine {
                                 })
                             },
                             "first_launch_may_download_package":first_launch_may_download,
+                            "local_sites":local_sites,
+                            "search_options":options_preview,
+                        });
+                        let local_note = local_sites.as_ref().map_or(String::new(), |url| {
+                            format!(" Your own sites are searched too, from the index at {url}; that part stays on your network.")
                         });
                         (
-                            format!("Search the web with {}", config.name),
-                            "Call the configured MCP web-search tool with exactly this query. If the server is not connected, start the previewed process first. The process and search provider have ordinary network access; no environment values are shown in the preview.".into(),
+                            format!("Search {} with {}", if images { "for images" } else { "the web" }, config.name),
+                            format!("Call the configured MCP web-search tool with exactly this query. If the server is not connected, start the previewed process first. The process and search provider have ordinary network access; no environment values are shown in the preview.{local_note}"),
                             details,
                             Operation::McpWebSearch {
                                 server_id: config.id,
-                                tool_name: mapping.tool,
+                                tool_name: tool,
                                 query,
                                 limit,
                                 arguments,
                                 config_hash,
+                                local_sites,
+                                options,
+                                applied_options: applied.iter().map(|s| s.to_string()).collect(),
+                                images,
                             },
                         )
                     }
@@ -698,7 +738,7 @@ impl ToolEngine {
                 }
                 let cwd = config.cwd.as_deref().unwrap_or(self.root());
                 let details = json!({"server_id":id,"name":config.name,"program":config.program,"args":config.args,"cwd":cwd,"environment_keys":config.env.keys().collect::<Vec<_>>()});
-                (format!("Start MCP: {}",config.name),"The server is an external program with your OS permissions. Starting it is approved here; each tool call requires its own approval.".into(),details,Operation::McpConnect{config})
+                (format!("Start MCP: {}",config.name),"The server is an external program with your OS permissions. Starting it is approved here; each tool call requires its own approval.".into(),details,Operation::McpConnect{config:Box::new(config)})
             }
             "mcp_call" => {
                 let server_id = required(args, "server_id")?;
