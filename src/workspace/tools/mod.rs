@@ -195,6 +195,9 @@ pub enum Operation {
         local_sites: Option<String>,
         #[serde(default)]
         options: Box<integrations::SearchOptions>,
+        /// Search SearXNG's image category instead of the web.
+        #[serde(default)]
+        images: bool,
     },
     McpWebSearch {
         server_id: String,
@@ -210,6 +213,8 @@ pub enum Operation {
         /// Standard options the mapped arguments carry.
         #[serde(default)]
         applied_options: Vec<String>,
+        #[serde(default)]
+        images: bool,
     },
     TextBrowserSearch {
         browser: String,
@@ -313,6 +318,7 @@ pub struct ToolEngine {
     network_enabled: Arc<AtomicBool>,
     /// Whether public knowledge sources may be used as a search provider.
     knowledge_search: Arc<AtomicBool>,
+    search_depth: Arc<Mutex<String>>,
     knowledge_endpoints: Arc<Mutex<crate::knowledge_search::Endpoints>>,
     workspace_tools_enabled: Arc<AtomicBool>,
     search_url: Arc<Mutex<Option<String>>>,
@@ -360,6 +366,7 @@ impl ToolEngine {
             pending: Arc::new(Mutex::new(HashMap::new())),
             network_enabled: Arc::new(AtomicBool::new(false)),
             knowledge_search: Arc::new(AtomicBool::new(false)),
+            search_depth: Arc::new(Mutex::new("balanced".into())),
             knowledge_endpoints: Arc::new(
                 Mutex::new(crate::knowledge_search::Endpoints::default()),
             ),
@@ -399,6 +406,61 @@ impl ToolEngine {
     /// disclosed fallback when every text browser fails. Off by default.
     pub fn set_knowledge_search(&self, enabled: bool) {
         self.knowledge_search.store(enabled, Ordering::Relaxed);
+    }
+
+    /// "speed", "balanced" or "quality": sets how many results a search returns
+    /// when the model does not ask for a number.
+    pub fn set_search_depth(&self, depth: &str) {
+        if let Ok(mut current) = self.search_depth.lock() {
+            *current = depth.to_owned();
+        }
+    }
+
+    fn default_search_limit(&self) -> usize {
+        self.search_depth
+            .lock()
+            .map(|depth| crate::settings::search_depth_limit(&depth))
+            .unwrap_or(8)
+    }
+
+    /// An image search goes to an MCP server set up for images, or to SearXNG.
+    /// DuckDuckGo through a text browser and the knowledge sources cannot search images.
+    fn image_search_provider(&self, requested: Option<&str>) -> Result<SearchProvider> {
+        let configs: Vec<McpServerConfig> = self
+            .mcp_configs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP configuration lock failed"))?
+            .values()
+            .filter(|config| {
+                config.enabled
+                    && config.web_search.as_ref().is_some_and(|s| s.image_search.is_some())
+            })
+            .cloned()
+            .collect();
+        let mut ordered: Vec<&McpServerConfig> = configs.iter().collect();
+        ordered.sort_by_key(|config| {
+            (
+                requested != Some(config.id.as_str()),
+                !self.mcp_is_connected(&config.id).unwrap_or(false),
+            )
+        });
+        if let Some(config) = ordered.first() {
+            let mapping = config.web_search.clone().context("MCP web-search mapping was removed")?;
+            return Ok(SearchProvider::Mcp {
+                connected: self.mcp_is_connected(&config.id)?,
+                config: Box::new((*config).clone()),
+                mapping: Box::new(mapping),
+            });
+        }
+        let searxng = self
+            .search_url
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Search configuration lock failed"))?
+            .clone();
+        if let Some(base_url) = searxng {
+            return Ok(SearchProvider::Searxng { base_url });
+        }
+        bail!("Image search needs SearXNG or an MCP search server set up for images (the Kagi preset). DuckDuckGo through a text browser and the public knowledge sources cannot search images")
     }
 
     /// Points the knowledge sources somewhere else; for tests.
@@ -1144,15 +1206,16 @@ fn private_create(path: &Path) -> Result<fs::File> {
 /// the Bible lexicon, the Knowledge Cache) are offered only when a local sites
 /// address is configured, so other installations never see them.
 fn web_search_parameters(local_sites: bool) -> Value {
-    let mut modes = vec!["general", "encyclopedia", "academic", "tech"];
+    let mut modes = vec!["general", "images", "encyclopedia", "academic", "tech"];
     let mut description = String::from("Optional. ");
     if local_sites {
         modes.extend(["herbal", "offline", "bible", "knowledge"]);
         description.push_str("herbal = the user's own Herb Helper site (herbs, formulas, evidence, safety, interactions and preparation) plus NOMAD's health libraries; use it FIRST for any question about herbs, herbal or natural remedies, supplements or their safety, and prefer it to the web. offline = the NOMAD offline library on the user's home server (Kiwix: offline Wikipedia, survival and water treatment, programming docs and any other installed libraries); use it for reference questions those libraries cover, or when the web is unavailable. bible = the user's Ethiopian Bible Research Lexicon (Ge'ez and related biblical texts, editions and review status). knowledge = the user's Knowledge Cache: sourced articles and dictionary definitions for topics from the user's past conversations, grouped by domain; check it first when a topic was discussed before, and still cite the article's own sources. These four are the user's own sites on this computer; queries never leave it. ");
     }
+    description.push_str("images = pictures (each result has image_url and the page url; needs SearXNG or an image-capable MCP server); ");
     description.push_str("encyclopedia = Wikipedia (definitions, concepts, history); academic = arXiv and Crossref (papers and abstracts); tech = Hacker News and GitHub (tools, libraries, engineering discussion); general = the ordinary web search (the same as omitting mode). Use a specialised mode when a topic clearly fits it; for research and anything current, omit mode.");
     json!({
-        "query":{"type":"string","minLength":1,"maxLength":2048},
+        "query":{"type":"string","minLength":1,"maxLength":2048,"description":"Concise search keywords, not the user's whole sentence: \"rename local git branch\" rather than \"how do I rename my local git branch?\"."},
         "limit":{"type":"integer","minimum":1,"maximum":20},
         "mode":{"type":"string","enum":modes,"description":description},
         "time_range":{"type":"string","enum":integrations::TIME_RANGES,"description":"Optional. Only pages from the past day, week, month or year; use it for news and other recent events."},
@@ -2584,6 +2647,31 @@ for line in sys.stdin:
         for part in ["time_range=month", "language=en-US", "safesearch=1"] {
             assert!(search.contains(part), "{search}");
         }
+    }
+
+    #[test]
+    fn image_search_needs_an_image_capable_provider_and_depth_sets_the_default_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_network_enabled(true);
+        e.set_knowledge_search(true);
+        let error = e.prepare("web_search", &json!({"query":"red fox","mode":"images"})).unwrap_err().to_string();
+        assert!(error.contains("Image search needs SearXNG"), "{error}");
+        e.set_search_url(Some("http://127.0.0.1:9".into())).unwrap();
+        let action = approval(e.prepare("web_search", &json!({"query":"red fox","mode":"images"})).unwrap());
+        assert_eq!(action.details["kind"], "images");
+        assert_eq!(action.details["limit"], 8, "balanced depth by default");
+        let crate::tools::Operation::WebSearch { images, fallbacks, local_sites, .. } = &action.operation else {
+            panic!("expected a SearXNG image search")
+        };
+        assert!(*images && fallbacks.is_empty() && local_sites.is_none());
+        e.set_search_depth("speed");
+        let action = approval(e.prepare("web_search", &json!({"query":"red fox","mode":"images"})).unwrap());
+        assert_eq!(action.details["limit"], 5);
+        e.set_search_depth("quality");
+        let action = approval(e.prepare("web_search", &json!({"query":"red fox","mode":"images","limit":3})).unwrap());
+        assert_eq!(action.details["limit"], 3, "an explicit count wins");
     }
 
     #[test]

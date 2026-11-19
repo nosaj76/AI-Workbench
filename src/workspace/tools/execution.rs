@@ -198,6 +198,7 @@ impl ToolEngine {
                 fallbacks,
                 local_sites,
                 options,
+                images,
             } => {
                 self.require_network()?;
                 if self
@@ -212,22 +213,27 @@ impl ToolEngine {
                 }
                 let local = local_site_results(local_sites.as_deref(), query, *limit);
                 let with_local = |value: Value| with_local_sites(value, &local);
-                let searxng_error = match integrations::search_searxng_with(base_url, query, *limit, options) {
-                    Ok(results) => {
-                        let note = results.is_empty().then_some(
-                            "SearXNG answered and every engine responded, but none found a match.",
-                        );
+                let searxng_error = match integrations::search_searxng_full(base_url, query, *limit, options, *images) {
+                    Ok(found) => {
+                        let note = found.results.is_empty().then_some(if *images {
+                            "SearXNG answered, but its image engines found no pictures."
+                        } else {
+                            "SearXNG answered and every engine responded, but none found a match."
+                        });
                         return Ok(with_local(json!({
                             "ok":true,
                             "query":query,
                             "limit":limit,
+                            "kind":if *images { "images" } else { "web" },
                             "provider":{"type":"searxng","server":base_url},
-                            "result_count":results.len(),
-                            "results":results,
+                            "result_count":found.results.len(),
+                            "results":found.results,
+                            "suggestions":found.suggestions,
                             "search_options":options.report(&options.searxng_applied()),
                             "note":note,
                         })));
                     }
+                    Err(error) if *images => bail!("SearXNG image search failed: {error:#}"),
                     Err(error) => format!("{error:#}"),
                 };
                 // Approved in the preview: retry through DuckDuckGo with the text
@@ -518,6 +524,7 @@ impl ToolEngine {
                 local_sites,
                 options,
                 applied_options,
+                images,
             } => {
                 self.require_network()?;
                 let config = self.mcp_config(server_id)?;
@@ -583,8 +590,10 @@ impl ToolEngine {
                             "server_name":config.name,
                             "tool":tool_name,
                         },
+                        "kind":if *images { "images" } else { "web" },
                         "result_count":results.len(),
                         "results":results,
+                        "suggestions":integrations::mcp_suggestions(&result),
                         "search_options":options.report(&applied),
                         "provider_text":raw_text,
                         "note":(ok && results.is_empty() && raw_text.as_deref().is_some_and(|t| !t.trim().is_empty()))

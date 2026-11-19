@@ -255,6 +255,78 @@ fn thread_text(thread: &integrations::StackExchangeThread) -> String {
     text
 }
 
+/// A short keyword query for `request.question`, written by the request's model.
+/// Falls back to removing filler words when the model fails or replies badly.
+pub fn search_query(request: &QaRequest, events: &Sender<AgentEvent>, cancel: Arc<AtomicBool>) -> String {
+    let question = request.question.trim();
+    let fallback = keyword_query(question);
+    let mut settings = agents::child_settings(&request.settings, false);
+    settings.thinking = "off".into();
+    settings.temperature = 0.0;
+    settings.num_predict = 48;
+    let system = "You turn questions into web search queries. Reply with one line of search keywords \
+        (at most 12 words) that would find pages answering the question. Keep product names, versions, \
+        error messages and technical terms exactly. No quotes, no explanation.";
+    let reply = agents::infer(
+        settings,
+        None,
+        &request.data_dir,
+        &request.model,
+        system,
+        &format!("Question: {question}"),
+        "qa-search-query",
+        false,
+        events,
+        cancel,
+    );
+    reply
+        .ok()
+        .and_then(|reply| clean_query(&reply.answer))
+        .unwrap_or(fallback)
+}
+
+/// The first line of a model reply as a usable query, or None.
+fn clean_query(reply: &str) -> Option<String> {
+    let line = reply
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("<think"))?;
+    let mut query = line.to_string();
+    for prefix in ["search query:", "query:", "keywords:"] {
+        if query.to_lowercase().starts_with(prefix) {
+            query = query[prefix.len()..].to_string();
+        }
+    }
+    let query = query
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '*' | '“' | '”'))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words = query.split(' ').count();
+    (!query.is_empty() && query.chars().count() <= 200 && words <= 20).then_some(query)
+}
+
+/// Removes question words and filler ("how do I", "please"), keeping at most 12 words.
+pub fn keyword_query(question: &str) -> String {
+    const FILLER: &[&str] = &[
+        "how", "do", "does", "did", "i", "we", "you", "can", "could", "would", "should", "what", "is",
+        "are", "was", "the", "a", "an", "please", "tell", "me", "my", "explain", "there", "way", "to",
+        "anyone", "know", "if", "possible", "some", "help",
+    ];
+    let words: Vec<&str> = question
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| matches!(c, '?' | '!' | ',' | '.' | ';' | ':' | '"' | '\'')))
+        .filter(|w| !w.is_empty() && !FILLER.contains(&w.to_lowercase().as_str()))
+        .take(12)
+        .collect();
+    if words.is_empty() {
+        question.trim().to_owned()
+    } else {
+        words.join(" ")
+    }
+}
+
 /// Search the Q&A sites and read the best threads. No model is involved.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
@@ -589,8 +661,18 @@ fn answer_online(
         .clone()
         .unwrap_or_else(|| search_browsers(&request.settings));
     let source_chars = per_source_chars(&request.settings, request.max_sources);
+    // Search engines match keywords better than whole sentences; the original
+    // question is still the one answered.
+    let search = if request.settings.search_query_rewrite {
+        search_query(request, events, cancel.clone())
+    } else {
+        question.to_owned()
+    };
+    if search != question {
+        agents::status(events, &format!("Searching for: {search}"));
+    }
     let gathered = gather(
-        question,
+        &search,
         request
             .settings
             .network_tools
@@ -743,11 +825,31 @@ mod tests {
     }
 
     #[test]
+    fn questions_become_short_keyword_queries() {
+        // A model that cannot be reached falls back to the keyword query.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let settings = Settings { base_url: format!("http://{}", closed.local_addr().unwrap()), ..Default::default() };
+        drop(closed);
+        let dir = tempfile::tempdir().unwrap();
+        let request = QaRequest::new(settings, dir.path().to_path_buf(), "How do I list open ports on Linux?".into(), "m".into());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert_eq!(search_query(&request, &tx, Arc::new(AtomicBool::new(false))), "list open ports on Linux");
+        assert_eq!(keyword_query("How do I rename a local git branch?"), "rename local git branch");
+        assert_eq!(keyword_query("What is the capital of France?"), "capital of France");
+        assert_eq!(keyword_query("??"), "??");
+        assert_eq!(clean_query("Query: \"rust borrow checker E0502\"\nextra").as_deref(), Some("rust borrow checker E0502"));
+        assert_eq!(clean_query("<think>hmm</think>\nlinux disk usage command").as_deref(), Some("linux disk usage command"));
+        assert!(clean_query("   ").is_none());
+        assert!(clean_query(&"word ".repeat(30)).is_none());
+    }
+
+    #[test]
     fn only_qa_threads_are_selected_once_each() {
         let r = |url: &str| SearchResult {
             title: url.into(),
             url: url.into(),
             snippet: String::new(),
+            ..Default::default()
         };
         let results = vec![
             r("https://stackoverflow.com/questions/927358/undo"),

@@ -173,6 +173,19 @@ impl Workbench {
             ui.checkbox(&mut draft.network_tools, "Enable explicit web fetch and search tools");
             ui.label("Optional SearXNG fallback URL (blank disables it)");
             ui.add(egui::TextEdit::singleline(&mut draft.searxng_url).desired_width(f32::INFINITY));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Web search depth:");
+                for (value, label) in crate::settings::SEARCH_DEPTHS {
+                    ui.radio_value(&mut draft.search_depth, value.to_string(), label);
+                }
+            });
+            ui.small(match draft.search_depth.as_str() {
+                "speed" => "Speed: one search, answered from result snippets. Fastest; least checked.",
+                "quality" => "Quality: several searches, four or more sources read and compared. Slowest; most thorough.",
+                _ => "Balanced: one or two searches, the two or three best pages read before answering.",
+            });
+            ui.checkbox(&mut draft.search_query_rewrite, "Turn Q&A questions into short search keywords first")
+                .on_hover_text("The Q&A lookup asks the model for a keyword query before searching (falls back to removing filler words). The answer still uses your full question.");
             ui.label("Local sites address for self-hosted search services (blank turns them off)");
             ui.add(egui::TextEdit::singleline(&mut draft.local_sites_url).desired_width(f32::INFINITY));
             ui.small("Only the host is used; each site keeps its own port (8201, 8090, 8203, 8205).");
@@ -349,42 +362,42 @@ impl Workbench {
         };
 
         let mut changed = false;
-        if ui
-            .button("Add or repair official Brave Search preset")
-            .clicked()
-        {
-            let mut preset = crate::mcp::McpServerConfig::brave_search_preset();
-            if let Some(existing) = servers
-                .iter()
-                .find(|server| server.id == crate::mcp::BRAVE_SEARCH_SERVER_ID)
-            {
-                preset.enabled = existing.enabled;
-                if let Some(key) = existing.env.get("BRAVE_API_KEY") {
-                    preset.env.insert("BRAVE_API_KEY".into(), key.clone());
+        ui.horizontal_wrapped(|ui| {
+            for preset in &crate::mcp::SEARCH_PRESETS {
+                if ui
+                    .button(format!("Add or repair {} preset", preset.provider))
+                    .on_hover_text(format!("Official {} MCP server, pinned to {}. Keeps your key and on/off choice.", preset.provider, preset.package))
+                    .clicked()
+                {
+                    let Some(mut fresh) = crate::mcp::McpServerConfig::search_preset(preset.id) else {
+                        continue;
+                    };
+                    if let Some(existing) = servers.iter().find(|server| server.id == preset.id) {
+                        fresh.enabled = existing.enabled;
+                        if let Some(key) = existing.env.get(preset.key_env) {
+                            fresh.env.insert(preset.key_env.into(), key.clone());
+                        }
+                    }
+                    match servers.iter().position(|server| server.id == preset.id) {
+                        Some(index) => servers[index] = fresh,
+                        None => servers.push(fresh),
+                    }
+                    changed = true;
                 }
             }
-            if let Some(index) = servers
-                .iter()
-                .position(|server| server.id == crate::mcp::BRAVE_SEARCH_SERVER_ID)
-            {
-                servers[index] = preset;
-            } else {
-                servers.push(preset);
-            }
-            changed = true;
-        }
+        });
 
-        if let Some(server) = servers
-            .iter_mut()
-            .find(|server| server.id == crate::mcp::BRAVE_SEARCH_SERVER_ID)
-        {
+        for server in servers.iter_mut() {
+            let Some(preset) = crate::mcp::search_preset(&server.id) else {
+                continue;
+            };
             ui.group(|ui| {
-                ui.strong("Brave Search MCP");
-                ui.label(format!(
-                    "Pinned package: {}",
-                    crate::mcp::BRAVE_SEARCH_PACKAGE
-                ));
-                let enabled = ui.checkbox(&mut server.enabled, "Enable Brave Search as an MCP web-search provider");
+                ui.strong(format!("{} MCP", preset.provider));
+                ui.label(format!("Pinned package: {} (started with {})", preset.package, preset.launcher));
+                let enabled = ui.checkbox(
+                    &mut server.enabled,
+                    format!("Enable {} as an MCP web-search provider", preset.provider),
+                );
                 if enabled.changed() {
                     changed = true;
                     if server.enabled {
@@ -392,9 +405,12 @@ impl Workbench {
                         draft.network_tools = true;
                     }
                 }
-                ui.label("Brave Search API key (stored in your local settings.json and masked in this field)");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{} API key (stored in your local settings.json and masked in this field).", preset.provider));
+                    ui.hyperlink_to("Get a key", preset.key_url);
+                });
                 let key_is_empty = {
-                    let key = server.env.entry("BRAVE_API_KEY".into()).or_default();
+                    let key = server.env.entry(preset.key_env.into()).or_default();
                     if ui
                         .add(
                             egui::TextEdit::singleline(key)
@@ -410,7 +426,7 @@ impl Workbench {
                 if server.enabled && key_is_empty {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
-                        "Enter BRAVE_API_KEY before saving an enabled Brave Search server.",
+                        format!("Enter {} before saving an enabled {} server.", preset.key_env, preset.provider),
                     );
                 }
                 if server.enabled && (!draft.mcp_enabled || !draft.network_tools) {
@@ -420,15 +436,20 @@ impl Workbench {
                     );
                 }
                 if crate::diagnostics::find_executable(&server.program).is_none() {
+                    let install = match preset.launcher {
+                        "uvx" => " Install uv (it provides uvx), e.g. `pipx install uv` or your distribution's uv package.",
+                        "npx" => " Install Node.js and npm (they provide npx).",
+                        _ => "",
+                    };
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
-                        format!(
-                            "Executable {:?} is not currently available on PATH.",
-                            server.program
-                        ),
+                        format!("Executable {:?} is not currently available on PATH.{install}", server.program),
                     );
                 }
-                ui.label("The first approved search may let npx download this pinned package. Search queries are then sent to Brave's API; local Ollama inference remains separate.");
+                ui.label(format!(
+                    "The first approved search may let {} download this pinned package. Search queries are then sent to {}'s API; local Ollama inference remains separate.",
+                    preset.launcher, preset.provider
+                ));
                 if let Err(error) = server.validate() {
                     ui.colored_label(ui.visuals().warn_fg_color, error.to_string());
                 }

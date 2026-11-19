@@ -975,7 +975,7 @@ fn research_web_search(
                 let hits = found
                     .results
                     .into_iter()
-                    .map(|r| integrations::SearchResult { title: r.title, url: r.url, snippet: r.snippet })
+                    .map(|r| integrations::SearchResult { title: r.title, url: r.url, snippet: r.snippet, ..Default::default() })
                     .collect();
                 return Ok((hits, failures));
             }

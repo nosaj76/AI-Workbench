@@ -43,24 +43,67 @@ provider could not apply, so the model does not claim a filter was used.
 
 Turn on **Settings → Connection and privacy → Enable explicit web fetch and search tools** first.
 
-## Configure the supplied Brave Search preset
+## Search presets: Brave, Exa and Kagi
 
-1. Open **Settings → Connection and privacy**.
-2. Enable **explicit web fetch and search tools**.
-3. Open **MCP servers and web search**.
-4. Select **Add or repair official Brave Search preset** when an older settings
-   file does not already contain it.
-5. Enter a Brave Search API key.
-6. Enable **Brave Search as an MCP web-search provider**. Enabling it also turns
-   on the global MCP and network switches in the draft.
-7. Save the complete settings draft.
-8. Start a normal chat and ask `search the web about Linux`.
-9. Inspect and approve the exact query. On first use, the preview also includes
-   the pinned `npx` stdio launch that may obtain the package.
+Three official search MCP servers can be added with one click. All start
+disabled and need your own API key from the provider.
 
-No project folder is required. Native tool calling still requires a compatible
-installed Ollama model. With automatic routing enabled, Workbench attempts to use
-a tool-capable coordinator.
+| Preset | Package (pinned) | Started with | Key | Time range | Language | Safe search | Images |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Brave Search | `@brave/brave-search-mcp-server@2.1.4` | `npx` (Node.js) | `BRAVE_API_KEY` | day–year | yes | yes | no |
+| Exa | `exa-mcp-server@3.4.3` | `npx` (Node.js) | `EXA_API_KEY` | no | no | no | no |
+| Kagi | `kagimcp==1.1.0` | `uvx` (uv) | `KAGI_API_KEY` | day–month | no | no | yes |
+
+1. Open **Settings → Connection and privacy** and enable **explicit web fetch
+   and search tools**.
+2. Open **MCP servers and web search** and select **Add or repair … preset**
+   for the provider. Repairing keeps your key and on/off choice.
+3. Enter the API key (**Get a key** opens the provider's page) and enable the
+   provider. Enabling it also turns on the global MCP and network switches.
+4. Save the settings, start a chat and ask `search the web about Linux`.
+5. Inspect and approve the exact query. On first use, the preview also shows the
+   pinned `npx` or `uvx` launch that may download the package.
+
+Install Node.js (for `npx`) or uv (for `uvx`) first; Settings warns when the
+launcher is missing. No project folder is required. Native tool calling still
+requires a compatible installed Ollama model.
+
+## Image search
+
+`web_search` with `mode: "images"` returns pictures: each result has the page
+`url`, `image_url` and, when available, a `thumbnail`. It uses an MCP server set
+up for images (the Kagi preset) or SearXNG's image category. DuckDuckGo through
+a text browser and the public knowledge sources cannot search images, so an
+image search fails with a clear message when neither is set up.
+
+## Related searches
+
+SearXNG's suggested searches, and any `suggestions` or `related_searches` an
+MCP server returns, appear in each result as `suggestions`. In Chat, the
+suggestions from the latest answer's searches are shown under it as **Related
+searches**; clicking one puts "Search the web for …" in the message box.
+
+## Search depth
+
+**Settings → Connection and privacy** (or **Options** in Chat) sets how
+thoroughly chat searches:
+
+| Depth | What the model is asked to do | Results per search |
+| --- | --- | --- |
+| Speed | One search; answer from the snippets | 5 |
+| Balanced (default) | One or two searches; read the two or three best pages | 8 |
+| Quality | Three to five searches; read and compare four or more sources | 12 |
+
+An explicit `limit` in a search always wins over the default count.
+
+## Query rewriting
+
+The Q&A lookup searches with a short keyword query rather than the whole
+question: the model writes it ("How do I rename a local git branch?" →
+`rename local git branch`), and filler words are removed instead if the model
+fails. The answer still uses the full question. Turn it off with **Turn Q&A
+questions into short search keywords first**. In chat, the `web_search` tool
+asks the model itself for concise keywords.
 
 ## Runtime and privacy boundaries
 
@@ -131,8 +174,14 @@ applied. `language_argument` receives the language code (`en` for `en-GB`) and
 words into the provider's values; an empty map sends the standard word. An
 option argument may share its name with a fixed argument, whose value is then
 the default, but never with the query or limit argument. The Brave preset uses
-the mapping shown above; use **Add or repair official Brave Search preset** to
-update an older saved copy.
+the mapping shown above; use **Add or repair Brave Search preset** to update an
+older saved copy. A `null` value marks a word the provider does not support
+(Kagi maps `"year": null`): nothing is sent and the option is reported as not
+applied.
+
+For image search, add `"image_search": {"tool": null, "extra_arguments":
+{"workflow": "images"}}`: `tool` names a different image tool, or `null` to use
+the search tool with the extra arguments.
 
 Provider selection is deterministic:
 

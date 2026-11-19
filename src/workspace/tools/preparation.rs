@@ -497,7 +497,7 @@ impl ToolEngine {
                 if query.chars().count() > 2_048 {
                     bail!("Web-search query exceeds 2,048 characters");
                 }
-                let limit = uint(args, "limit", 10, 1, 20);
+                let limit = uint(args, "limit", self.default_search_limit(), 1, 20);
                 let requested_provider = args
                     .get("provider")
                     .map(|value| {
@@ -516,7 +516,9 @@ impl ToolEngine {
                 // "general" is the ordinary web search: it used to send research
                 // questions to Wikipedia and Hacker News only, skipping the real
                 // web provider. The specialised modes still pick their sources.
+                let images = mode == Some("images");
                 let provider = match mode {
+                    Some("images") => self.image_search_provider(requested_provider)?,
                     Some(mode) if mode != "general" => self.knowledge_provider(mode)?,
                     _ => self.search_provider(requested_provider)?,
                 };
@@ -554,6 +556,20 @@ impl ToolEngine {
                             },
                         )
                     }
+                    SearchProvider::Searxng { base_url } if images => (
+                        "Search for images".into(),
+                        "Send this query to the configured SearXNG instance's image search and the image engines it uses. Only image results are returned; nothing else is sent or executed.".into(),
+                        json!({"query":query,"provider":"searxng","kind":"images","server":base_url,"limit":limit,"search_options":options_preview}),
+                        Operation::WebSearch {
+                            query,
+                            base_url,
+                            limit,
+                            fallbacks: Vec::new(),
+                            local_sites: None,
+                            options,
+                            images: true,
+                        },
+                    ),
                     SearchProvider::Searxng { base_url } => {
                         let fallbacks: Vec<(String, String)> = self
                             .text_browser_fallback_candidates()?
@@ -584,6 +600,7 @@ impl ToolEngine {
                                 fallbacks,
                                 local_sites,
                                 options,
+                                images: false,
                             },
                         )
                     }
@@ -659,15 +676,15 @@ impl ToolEngine {
                         mapping,
                         connected,
                     } => {
-                        let (arguments, applied) = mapping.arguments_with(&query, limit, &options)?;
-                        let local_sites = self.local_sites_url()?;
+                        let (tool, arguments, applied) = mapping.request(&query, limit, &options, images)?;
+                        let local_sites = if images { None } else { self.local_sites_url()? };
                         let config_hash = hash(&serde_json::to_vec(&config)?);
                         let cwd = config.cwd.as_deref().unwrap_or(self.root());
                         let first_launch_may_download = !connected
                             && Path::new(&config.program)
                                 .file_name()
                                 .and_then(|name| name.to_str())
-                                .is_some_and(|name| name == "npx");
+                                .is_some_and(|name| name == "npx" || name == "uvx");
                         let details = json!({
                             "query":query,
                             "limit":limit,
@@ -675,7 +692,8 @@ impl ToolEngine {
                             "server_id":config.id,
                             "server_name":config.name,
                             "connected":connected,
-                            "tool":mapping.tool,
+                            "tool":tool,
+                            "kind":if images { "images" } else { "web" },
                             "arguments":arguments,
                             "launch_if_needed":if connected { Value::Null } else {
                                 json!({
@@ -693,12 +711,12 @@ impl ToolEngine {
                             format!(" Your own sites are searched too, from the index at {url}; that part stays on your network.")
                         });
                         (
-                            format!("Search the web with {}", config.name),
+                            format!("Search {} with {}", if images { "for images" } else { "the web" }, config.name),
                             format!("Call the configured MCP web-search tool with exactly this query. If the server is not connected, start the previewed process first. The process and search provider have ordinary network access; no environment values are shown in the preview.{local_note}"),
                             details,
                             Operation::McpWebSearch {
                                 server_id: config.id,
-                                tool_name: mapping.tool,
+                                tool_name: tool,
                                 query,
                                 limit,
                                 arguments,
@@ -706,6 +724,7 @@ impl ToolEngine {
                                 local_sites,
                                 options,
                                 applied_options: applied.iter().map(|s| s.to_string()).collect(),
+                                images,
                             },
                         )
                     }

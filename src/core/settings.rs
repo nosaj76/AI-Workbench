@@ -51,6 +51,10 @@ pub struct Settings {
     pub enter_sends: bool,
     /// After a conversation's first answer, ask the same model for a short title.
     pub auto_titles: bool,
+    /// How thoroughly chat searches the web: "speed", "balanced" or "quality".
+    pub search_depth: String,
+    /// Turn a question into a short keyword query before searching Q&A sites.
+    pub search_query_rewrite: bool,
     pub temperature: f32,
     pub num_ctx: u32,
     pub num_predict: i32,
@@ -156,6 +160,8 @@ impl Default for Settings {
             font_scale: 1.0,
             enter_sends: false,
             auto_titles: true,
+            search_depth: "balanced".into(),
+            search_query_rewrite: true,
             temperature: 0.6,
             num_ctx: 8192,
             num_predict: -1,
@@ -180,7 +186,11 @@ impl Default for Settings {
             max_tool_rounds: 24,
             max_context_chars: 8_000,
             external_agents_json: serde_json::to_string(&crate::external_agents::AgentProfile::presets()).expect("static agent profiles serialize"),
-            mcp_json: serde_json::to_string_pretty(&[crate::mcp::McpServerConfig::brave_search_preset()])
+            mcp_json: serde_json::to_string_pretty(&[
+                crate::mcp::McpServerConfig::brave_search_preset(),
+                crate::mcp::McpServerConfig::exa_search_preset(),
+                crate::mcp::McpServerConfig::kagi_search_preset(),
+            ])
                 .expect("static MCP preset serializes"),
             mcp_enabled: false,
             tts_program: "espeak-ng".into(),
@@ -334,6 +344,8 @@ impl Settings {
         let mut s = self.system_prompt.clone();
         s.push_str("\n\n");
         s.push_str(TOOL_CAPABILITY_SYSTEM);
+        s.push_str("\n\n");
+        s.push_str(search_depth_instruction(&self.search_depth));
         if let Some(profile) = self.profiles.get(self.selected_profile) {
             if !profile.instruction.is_empty() {
                 s.push_str("\n\nProfile instruction:\n");
@@ -417,6 +429,30 @@ pub fn clamp_predict(num_predict: i32, low: i32, high: i32) -> i32 {
     }
 }
 
+pub const SEARCH_DEPTHS: [(&str, &str); 3] = [
+    ("speed", "Speed"),
+    ("balanced", "Balanced"),
+    ("quality", "Quality"),
+];
+
+/// How many results a web search returns when the model does not ask for a number.
+pub fn search_depth_limit(depth: &str) -> usize {
+    match depth {
+        "speed" => 5,
+        "quality" => 12,
+        _ => 8,
+    }
+}
+
+/// The web-search habit for the chosen depth, added to the system prompt.
+pub fn search_depth_instruction(depth: &str) -> &'static str {
+    match depth {
+        "speed" => "Web search depth: SPEED. When you search, run one web_search with concise keywords and answer from the result snippets; fetch a page only when the snippets cannot answer the question. Say that the answer is based on search snippets.",
+        "quality" => "Web search depth: QUALITY. When you search, run three to five web_search calls with different phrasings, open at least four relevant sources with fetch_url, compare them, note where they disagree, and cite each claim.",
+        _ => "Web search depth: BALANCED. When you search, run one or two web_search calls with concise keywords and open the two or three most relevant results with fetch_url before answering.",
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -460,6 +496,17 @@ mod tests {
         proposed.tts_args = "[]".into();
         proposed.profiles.clear();
         assert!(proposed.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_include_balanced_search_depth_and_its_instruction() {
+        let settings = Settings::default();
+        assert_eq!(settings.search_depth, "balanced");
+        assert!(settings.search_query_rewrite);
+        assert!(settings.system().contains("Web search depth: BALANCED"));
+        let speed = Settings { search_depth: "speed".into(), ..Settings::default() };
+        assert!(speed.system().contains("Web search depth: SPEED"));
+        assert_eq!((search_depth_limit("speed"), search_depth_limit("balanced"), search_depth_limit("quality"), search_depth_limit("odd")), (5, 8, 12, 8));
     }
 
     #[test]

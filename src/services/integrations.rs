@@ -524,11 +524,23 @@ pub struct WebPage {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
+    /// Image searches: the full image, and a smaller preview when the provider has one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thumbnail: String,
+}
+
+/// A SearXNG answer: the results and the related searches it suggests.
+#[derive(Debug, Clone, Default)]
+pub struct SearxngResponse {
+    pub results: Vec<SearchResult>,
+    pub suggestions: Vec<String>,
 }
 
 /// Optional search refinements every provider is asked to honour. Each search
@@ -1064,6 +1076,7 @@ fn rank_local_pages(index: &Value, query: &str, limit: usize) -> Vec<SearchResul
                 title: title.to_owned(),
                 url: format!("http://{site}.localhost{path}"),
                 snippet: local_snippet(text, &text_l, &terms),
+                ..Default::default()
             },
         ));
     }
@@ -1127,6 +1140,18 @@ pub fn search_searxng_with(
     limit: usize,
     options: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
+    Ok(search_searxng_full(base_url, query, limit, options, false)?.results)
+}
+
+/// SearXNG search returning results and suggested related searches. `images`
+/// searches SearXNG's image category; each result then carries `image_url`.
+pub fn search_searxng_full(
+    base_url: &str,
+    query: &str,
+    limit: usize,
+    options: &SearchOptions,
+    images: bool,
+) -> Result<SearxngResponse> {
     if query.trim().is_empty() || query.len() > 4096 {
         bail!("Search query is empty or too long");
     }
@@ -1139,6 +1164,9 @@ pub fn search_searxng_with(
     url.query_pairs_mut()
         .append_pair("q", query)
         .append_pair("format", "json");
+    if images {
+        url.query_pairs_mut().append_pair("categories", "images");
+    }
     if let Some(range) = &options.time_range {
         url.query_pairs_mut().append_pair("time_range", range);
     }
@@ -1191,31 +1219,46 @@ pub fn search_searxng_with(
             );
         }
     }
-    Ok(results
+    let text = |r: &Value, key: &str| r.get(key).and_then(Value::as_str).unwrap_or("").trim().to_owned();
+    let results = results
         .iter()
         .filter_map(|r| {
             let url = r.get("url")?.as_str()?;
             if validate_http_url(url).is_err() {
                 return None;
             }
+            let image = |key: &str| {
+                let value = text(r, key);
+                // SearXNG gives some image links without a scheme ("//host/x.jpg").
+                let value = if value.starts_with("//") { format!("https:{value}") } else { value };
+                if validate_http_url(&value).is_ok() { value } else { String::new() }
+            };
             Some(SearchResult {
-                title: r
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
+                title: text(r, "title"),
                 url: url.to_owned(),
-                snippet: r
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .chars()
-                    .take(4000)
-                    .collect(),
+                snippet: text(r, "content").chars().take(4000).collect(),
+                image_url: if images { image("img_src") } else { String::new() },
+                thumbnail: if images { image("thumbnail_src") } else { String::new() },
             })
         })
+        .filter(|r| !images || !r.image_url.is_empty())
         .take(limit.clamp(1, 20))
-        .collect())
+        .collect();
+    let suggestions = json
+        .get("suggestions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.chars().count() <= 200)
+                .take(8)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(SearxngResponse { results, suggestions })
 }
 
 /// Terminal text browsers that can fetch a page source non-interactively,
@@ -1730,6 +1773,55 @@ pub fn normalize_mcp_search(reply: &Value, limit: usize) -> Vec<SearchResult> {
     out
 }
 
+/// Related searches a provider suggested, from keys such as `suggestions`,
+/// `related_searches` or `query_suggestions` anywhere in the reply's JSON.
+pub fn mcp_suggestions(reply: &Value) -> Vec<String> {
+    fn walk(value: &Value, out: &mut Vec<String>, depth: usize) {
+        if depth > 5 || out.len() >= 8 {
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let key = key.to_ascii_lowercase();
+                    if matches!(key.as_str(), "suggestions" | "related_searches" | "query_suggestions" | "related") {
+                        for item in child.as_array().into_iter().flatten() {
+                            let text = item.as_str().or_else(|| {
+                                ["query", "text", "title"].iter().find_map(|k| item.get(*k).and_then(Value::as_str))
+                            });
+                            if let Some(text) = text.map(str::trim).filter(|t| !t.is_empty() && t.chars().count() <= 200) {
+                                if !out.iter().any(|o| o == text) && out.len() < 8 {
+                                    out.push(text.to_owned());
+                                }
+                            }
+                        }
+                    } else {
+                        walk(child, out, depth + 1);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|i| walk(i, out, depth + 1)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(structured) = reply.get("structuredContent") {
+        walk(structured, &mut out, 0);
+    }
+    for text in reply
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.get("text").and_then(Value::as_str))
+    {
+        if let Ok(json) = serde_json::from_str::<Value>(text.trim()) {
+            walk(&json, &mut out, 0);
+        }
+    }
+    out
+}
+
 /// Plain text from an MCP reply's content items, for when no results could be read.
 pub fn mcp_reply_text(reply: &Value, max_chars: usize) -> String {
     let text = reply
@@ -1764,16 +1856,31 @@ fn collect_search_results(value: &Value, out: &mut Vec<SearchResult>, depth: usi
                 let mut snippet = field(&["description", "snippet", "content", "summary", "text", "body"])
                     .unwrap_or_default()
                     .to_owned();
-                if let Some(extra) = map.get("extra_snippets").and_then(Value::as_array) {
-                    for more in extra.iter().filter_map(Value::as_str).take(2) {
-                        snippet.push(' ');
-                        snippet.push_str(more);
+                // Exa returns "highlights", Brave "extra_snippets": short passages.
+                for key in ["highlights", "extra_snippets"] {
+                    for more in map.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).take(2) {
+                        if !snippet.is_empty() {
+                            snippet.push(' ');
+                        }
+                        snippet.push_str(more.trim());
                     }
                 }
+                let image = |keys: &[&str]| {
+                    keys.iter()
+                        .find_map(|k| match map.get(*k) {
+                            Some(Value::String(s)) => Some(s.trim().to_owned()),
+                            Some(Value::Object(o)) => o.get("url").and_then(Value::as_str).map(str::to_owned),
+                            _ => None,
+                        })
+                        .filter(|u| u.starts_with("http"))
+                        .unwrap_or_default()
+                };
                 out.push(SearchResult {
                     title: strip_tags(field(&["title", "name", "headline"]).unwrap_or_default()),
                     url: url.to_owned(),
                     snippet: strip_tags(&snippet).chars().take(4000).collect(),
+                    image_url: image(&["image_url", "img_src", "image", "properties"]),
+                    thumbnail: image(&["thumbnail", "thumbnail_src", "thumbnail_url"]),
                 });
                 return;
             }
@@ -1789,27 +1896,58 @@ fn collect_search_results(value: &Value, out: &mut Vec<SearchResult>, depth: usi
 
 fn parse_search_text(text: &str, out: &mut Vec<SearchResult>) {
     let before = out.len();
+    // "Title: …\nURL: …\nDescription: …" blocks. Exa adds "Highlights:" followed
+    // by passages on the next lines, and separates results with "---".
     for block in text.split("\n\n") {
         let mut title = String::new();
         let mut url = String::new();
         let mut snippet = String::new();
+        let mut continues_snippet = false;
         for line in block.lines().map(str::trim) {
-            let lower = line.to_ascii_lowercase();
-            let value = |prefix: &str| line[prefix.len()..].trim().to_owned();
-            if lower.starts_with("title:") {
-                title = value("title:");
-            } else if lower.starts_with("url:") {
-                url = value("url:");
-            } else if lower.starts_with("link:") {
-                url = value("link:");
-            } else if lower.starts_with("description:") {
-                snippet = value("description:");
-            } else if lower.starts_with("snippet:") {
-                snippet = value("snippet:");
+            let key = line
+                .split_once(':')
+                .map(|(k, _)| k.to_ascii_lowercase())
+                .filter(|k| k.len() <= 12 && k.chars().all(|c| c.is_ascii_alphabetic()));
+            let value = || {
+                let v = line.split_once(':').map_or("", |(_, v)| v).trim();
+                if v.eq_ignore_ascii_case("n/a") { String::new() } else { v.to_owned() }
+            };
+            match key.as_deref() {
+                Some("title") => {
+                    title = value();
+                    continues_snippet = false;
+                }
+                Some("url" | "link") => {
+                    url = value();
+                    continues_snippet = false;
+                }
+                Some("description" | "snippet" | "highlights" | "text" | "summary" | "content") => {
+                    let more = value();
+                    if !more.is_empty() {
+                        if !snippet.is_empty() {
+                            snippet.push(' ');
+                        }
+                        snippet.push_str(&more);
+                    }
+                    continues_snippet = true;
+                }
+                Some("published" | "author" | "date" | "score" | "id") => continues_snippet = false,
+                _ if continues_snippet && !line.is_empty() && line != "---" => {
+                    if !snippet.is_empty() {
+                        snippet.push(' ');
+                    }
+                    snippet.push_str(line);
+                }
+                _ => {}
             }
         }
         if url.starts_with("http") {
-            out.push(SearchResult { title, url, snippet });
+            out.push(SearchResult {
+                title,
+                url,
+                snippet: snippet.chars().take(4000).collect(),
+                ..Default::default()
+            });
         }
     }
     if out.len() > before {
@@ -1826,6 +1964,7 @@ fn parse_search_text(text: &str, out: &mut Vec<SearchResult>) {
                     title: line[open + 1..start].to_owned(),
                     url: url.to_owned(),
                     snippet: rest.to_owned(),
+                    ..Default::default()
                 });
             }
         } else if line.starts_with("http://") || line.starts_with("https://") {
@@ -1833,7 +1972,7 @@ fn parse_search_text(text: &str, out: &mut Vec<SearchResult>) {
             out.push(SearchResult {
                 title: previous.to_owned(),
                 url: url.to_owned(),
-                snippet: String::new(),
+                ..Default::default()
             });
         }
         if !line.is_empty() {
@@ -1898,6 +2037,7 @@ pub fn parse_duckduckgo_html(html: &str, limit: usize) -> Result<Vec<SearchResul
                 .chars()
                 .take(4000)
                 .collect(),
+            ..Default::default()
         });
         if results.len() >= limit.clamp(1, 20) {
             break;
@@ -1954,6 +2094,54 @@ fn duckduckgo_destination(href: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn searxng_image_search_returns_pictures_and_suggestions() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let n = socket.read(&mut request).unwrap();
+            let body = r#"{"results":[
+                {"title":"Red fox","url":"https://example.org/fox","img_src":"//images.example.org/fox.jpg","thumbnail_src":"https://images.example.org/fox_t.jpg"},
+                {"title":"No picture","url":"https://example.org/text"}
+            ],"suggestions":["red fox habitat"," arctic fox ",""]}"#;
+            let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            String::from_utf8_lossy(&request[..n]).lines().next().unwrap_or_default().to_owned()
+        });
+        let found = search_searxng_full(&url, "red fox", 5, &SearchOptions::default(), true).unwrap();
+        assert!(server.join().unwrap().contains("categories=images"));
+        assert_eq!(found.results.len(), 1, "a result without an image is dropped");
+        assert_eq!(found.results[0].image_url, "https://images.example.org/fox.jpg");
+        assert_eq!(found.results[0].thumbnail, "https://images.example.org/fox_t.jpg");
+        assert_eq!(found.suggestions, vec!["red fox habitat", "arctic fox"]);
+        // Web results never carry empty image fields in their JSON.
+        let web = SearchResult { title: "t".into(), url: "https://a.example/".into(), ..Default::default() };
+        assert!(serde_json::to_value(&web).unwrap().get("image_url").is_none());
+    }
+
+    #[test]
+    fn exa_and_kagi_replies_are_read_into_results() {
+        // Exa: text blocks with multi-line highlights, N/A fields and --- separators.
+        let exa = serde_json::json!({"content":[{"type":"text","text":
+            "Title: Tokio tutorial\nURL: https://tokio.rs/tokio/tutorial\nPublished: N/A\nAuthor: N/A\nHighlights:\nTokio is an async runtime.\nIt schedules tasks.\n\n---\n\nTitle: N/A\nURL: https://docs.rs/tokio\nPublished: 2026-01-02\nAuthor: Tokio team\nText: API docs"}]});
+        let results = normalize_mcp_search(&exa, 10);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(results[0].title, "Tokio tutorial");
+        assert_eq!(results[0].snippet, "Tokio is an async runtime. It schedules tasks.");
+        assert_eq!((results[1].title.as_str(), results[1].snippet.as_str()), ("", "API docs"));
+        // Kagi JSON: results grouped by category, images with image_url.
+        let kagi = serde_json::json!({"content":[{"type":"text","text":
+            "{\"search\":[{\"title\":\"Fox\",\"url\":\"https://en.wikipedia.org/wiki/Fox\",\"snippet\":\"A canid\"}],\"image\":[{\"title\":\"Fox photo\",\"url\":\"https://photos.example/fox\",\"image_url\":\"https://photos.example/fox.jpg\"}],\"related_searches\":[\"fox species\"]}"}]});
+        let results = normalize_mcp_search(&kagi, 10);
+        assert_eq!(results.len(), 2);
+        let photo = results.iter().find(|r| r.title == "Fox photo").unwrap();
+        assert_eq!(photo.image_url, "https://photos.example/fox.jpg");
+        assert_eq!(mcp_suggestions(&kagi), vec!["fox species"]);
+        assert!(mcp_suggestions(&exa).is_empty());
+    }
 
     #[test]
     fn search_options_are_validated_and_normalized() {
