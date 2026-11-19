@@ -63,6 +63,24 @@ pub struct McpWebSearchConfig {
     /// Provider-specific result-count ceiling. Workbench may impose a smaller bound.
     #[serde(default = "default_search_results")]
     pub max_results: usize,
+    /// Argument that receives a requested time range (day/week/month/year).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_range_argument: Option<String>,
+    /// Provider values for each time range, e.g. {"week": "pw"}. Empty: the standard word.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub time_range_values: BTreeMap<String, Value>,
+    /// Argument that receives the language code ("en" for "en-US").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_argument: Option<String>,
+    /// Argument that receives the region code ("US" for "en-US").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_argument: Option<String>,
+    /// Argument that receives a safe-search level (off/moderate/strict).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_search_argument: Option<String>,
+    /// Provider values for each safe-search level. Empty: the standard word.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub safe_search_values: BTreeMap<String, Value>,
 }
 
 impl Default for McpWebSearchConfig {
@@ -75,6 +93,12 @@ impl Default for McpWebSearchConfig {
             max_query_chars: default_search_query_chars(),
             max_query_words: None,
             max_results: default_search_results(),
+            time_range_argument: None,
+            time_range_values: BTreeMap::new(),
+            language_argument: None,
+            region_argument: None,
+            safe_search_argument: None,
+            safe_search_values: BTreeMap::new(),
         }
     }
 }
@@ -190,10 +214,48 @@ impl McpWebSearchConfig {
         if !(1..=100).contains(&self.max_results) {
             bail!("MCP web-search max_results must be between 1 and 100");
         }
+        // Option arguments may share a name with a fixed argument (the fixed value
+        // is then the default), but never with the query or the limit.
+        for (argument, label) in [
+            (&self.time_range_argument, "time-range"),
+            (&self.language_argument, "language"),
+            (&self.region_argument, "region"),
+            (&self.safe_search_argument, "safe-search"),
+        ] {
+            if let Some(name) = argument {
+                validate_mcp_name(name, &format!("MCP web-search {label} argument"))?;
+                if *name == self.query_argument || self.limit_argument.as_ref() == Some(name) {
+                    bail!("MCP web-search {label} argument cannot replace the query or limit argument");
+                }
+            }
+        }
+        for (values, allowed, label) in [
+            (&self.time_range_values, &crate::integrations::TIME_RANGES[..], "time_range_values"),
+            (&self.safe_search_values, &crate::integrations::SAFE_SEARCH_LEVELS[..], "safe_search_values"),
+        ] {
+            if let Some(key) = values.keys().find(|k| !allowed.contains(&k.as_str())) {
+                bail!("MCP web-search {label} has unknown key {key:?}; use {}", allowed.join(", "));
+            }
+            if serde_json::to_vec(values)?.len() > 4 * 1024 {
+                bail!("MCP web-search {label} exceed 4 KiB");
+            }
+        }
         Ok(())
     }
 
     pub fn arguments(&self, query: &str, limit: usize) -> Result<Value> {
+        Ok(self
+            .arguments_with(query, limit, &crate::integrations::SearchOptions::default())?
+            .0)
+    }
+
+    /// Tool arguments for a search, and which standard options they carry.
+    pub fn arguments_with(
+        &self,
+        query: &str,
+        limit: usize,
+        options: &crate::integrations::SearchOptions,
+    ) -> Result<(Value, Vec<&'static str>)> {
         self.validate()?;
         let chars = query.chars().count();
         if chars == 0 || chars > self.max_query_chars {
@@ -224,7 +286,31 @@ impl McpWebSearchConfig {
         if let Some(name) = &self.limit_argument {
             arguments.insert(name.clone(), json!(limit));
         }
-        Ok(Value::Object(arguments))
+        let mut applied = Vec::new();
+        let mapped = |values: &BTreeMap<String, Value>, word: &str| {
+            values.get(word).cloned().unwrap_or_else(|| json!(word))
+        };
+        if let (Some(name), Some(range)) = (&self.time_range_argument, &options.time_range) {
+            arguments.insert(name.clone(), mapped(&self.time_range_values, range));
+            applied.push("time_range");
+        }
+        let mut language_used = false;
+        if let (Some(name), Some(code)) = (&self.language_argument, options.language_code()) {
+            arguments.insert(name.clone(), json!(code));
+            language_used = true;
+        }
+        if let (Some(name), Some(region)) = (&self.region_argument, options.region()) {
+            arguments.insert(name.clone(), json!(region));
+            language_used = true;
+        }
+        if language_used {
+            applied.push("language");
+        }
+        if let (Some(name), Some(level)) = (&self.safe_search_argument, &options.safe_search) {
+            arguments.insert(name.clone(), mapped(&self.safe_search_values, level));
+            applied.push("safe_search");
+        }
+        Ok((Value::Object(arguments), applied))
     }
 }
 
@@ -285,6 +371,18 @@ impl McpServerConfig {
                 max_query_chars: 400,
                 max_query_words: Some(50),
                 max_results: 10,
+                // Brave's own parameter names and values.
+                time_range_argument: Some("freshness".into()),
+                time_range_values: BTreeMap::from([
+                    ("day".into(), json!("pd")),
+                    ("week".into(), json!("pw")),
+                    ("month".into(), json!("pm")),
+                    ("year".into(), json!("py")),
+                ]),
+                language_argument: Some("search_lang".into()),
+                region_argument: Some("country".into()),
+                safe_search_argument: Some("safesearch".into()),
+                safe_search_values: BTreeMap::new(),
             }),
         }
     }
@@ -875,6 +973,52 @@ fn capture_stderr<R: Read>(mut pipe: R, output: Arc<Mutex<Vec<u8>>>, stop: Arc<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brave_preset_maps_standard_options_to_brave_parameters() {
+        let mapping = McpServerConfig::brave_search_preset().web_search.unwrap();
+        let options = crate::integrations::SearchOptions {
+            time_range: Some("week".into()),
+            language: Some("en-GB".into()),
+            safe_search: Some("strict".into()),
+        };
+        let (arguments, applied) = mapping.arguments_with("rust", 5, &options).unwrap();
+        assert_eq!(
+            arguments,
+            json!({"query":"rust","count":5,"freshness":"pw","search_lang":"en","country":"GB","safesearch":"strict"})
+        );
+        assert_eq!(applied, vec!["time_range", "language", "safe_search"]);
+        // Without options the fixed default stays, and nothing is reported as applied.
+        let (arguments, applied) = mapping
+            .arguments_with("rust", 5, &crate::integrations::SearchOptions::default())
+            .unwrap();
+        assert_eq!(arguments, json!({"query":"rust","count":5,"safesearch":"moderate"}));
+        assert!(applied.is_empty());
+        assert_eq!(mapping.arguments("rust", 5).unwrap(), arguments);
+    }
+
+    #[test]
+    fn option_mappings_cannot_replace_the_query_or_use_unknown_values() {
+        let base = McpWebSearchConfig { tool: "search".into(), ..Default::default() };
+        let replaces_query = McpWebSearchConfig { time_range_argument: Some("query".into()), ..base.clone() };
+        assert!(replaces_query.validate().is_err());
+        let replaces_limit = McpWebSearchConfig { safe_search_argument: Some("count".into()), ..base.clone() };
+        assert!(replaces_limit.validate().is_err());
+        let unknown = McpWebSearchConfig {
+            time_range_argument: Some("recency".into()),
+            time_range_values: BTreeMap::from([("fortnight".into(), json!("2w"))]),
+            ..base.clone()
+        };
+        assert!(unknown.validate().is_err());
+        // An unmapped option is simply not applied.
+        let options = crate::integrations::SearchOptions { time_range: Some("day".into()), ..Default::default() };
+        let (arguments, applied) = base.arguments_with("q", 3, &options).unwrap();
+        assert_eq!(arguments, json!({"query":"q","count":3}));
+        assert!(applied.is_empty());
+        // Older saved mappings without the new fields still load.
+        let legacy: McpWebSearchConfig = serde_json::from_value(json!({"tool":"search","query_argument":"q"})).unwrap();
+        assert!(legacy.time_range_argument.is_none() && legacy.validate().is_ok());
+    }
 
     #[test]
     #[cfg(unix)]

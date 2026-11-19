@@ -678,6 +678,7 @@ fn auto_approval_answers_only_the_enabled_kinds_and_records_each_one() {
         limit: 5,
         fallbacks: vec![],
         local_sites: None,
+        options: Default::default(),
     };
     let delete = crate::tools::Operation::Delete {
         path: "a.txt".into(),

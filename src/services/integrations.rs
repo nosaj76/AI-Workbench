@@ -531,6 +531,125 @@ pub struct SearchResult {
     pub snippet: String,
 }
 
+/// Optional search refinements every provider is asked to honour. Each search
+/// result reports which ones the answering provider applied, so a model never
+/// assumes a filter was used when the provider could not apply it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchOptions {
+    /// "day", "week", "month" or "year": only pages from that recent period.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<String>,
+    /// BCP 47 language, optionally with a region: "en", "de", "en-US", "pt-BR".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// "off", "moderate" or "strict".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_search: Option<String>,
+}
+
+pub const TIME_RANGES: [&str; 4] = ["day", "week", "month", "year"];
+pub const SAFE_SEARCH_LEVELS: [&str; 3] = ["off", "moderate", "strict"];
+
+impl SearchOptions {
+    /// Reads and validates `time_range`, `language` and `safe_search` from tool arguments.
+    pub fn from_args(args: &Value) -> Result<Self> {
+        let text = |key: &str| -> Result<Option<String>> {
+            match args.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.trim().to_owned())),
+                Some(_) => bail!("{key} must be a string"),
+            }
+        };
+        let time_range = text("time_range")?.map(|v| v.to_ascii_lowercase());
+        if let Some(value) = &time_range {
+            if !TIME_RANGES.contains(&value.as_str()) {
+                bail!("time_range must be one of {}", TIME_RANGES.join(", "));
+            }
+        }
+        let safe_search = text("safe_search")?.map(|v| v.to_ascii_lowercase());
+        if let Some(value) = &safe_search {
+            if !SAFE_SEARCH_LEVELS.contains(&value.as_str()) {
+                bail!("safe_search must be one of {}", SAFE_SEARCH_LEVELS.join(", "));
+            }
+        }
+        let language = text("language")?
+            .map(|value| normalize_language(&value))
+            .transpose()?;
+        Ok(Self { time_range, language, safe_search })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.time_range.is_none() && self.language.is_none() && self.safe_search.is_none()
+    }
+
+    /// The primary language subtag: "en" for "en-US".
+    pub fn language_code(&self) -> Option<&str> {
+        self.language.as_deref().map(|l| l.split('-').next().unwrap_or(l))
+    }
+
+    /// The region subtag, upper case: "US" for "en-US".
+    pub fn region(&self) -> Option<&str> {
+        self.language.as_deref().and_then(|l| l.split_once('-')).map(|(_, r)| r)
+    }
+
+    /// The requested options, plus which of them a provider applied or could not apply.
+    pub fn report(&self, applied: &[&str]) -> Value {
+        if self.is_empty() {
+            return Value::Null;
+        }
+        let requested: Vec<&str> = [
+            ("time_range", self.time_range.is_some()),
+            ("language", self.language.is_some()),
+            ("safe_search", self.safe_search.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect();
+        let used: Vec<&str> = requested.iter().copied().filter(|n| applied.contains(n)).collect();
+        let not_applied: Vec<&str> = requested.iter().copied().filter(|n| !applied.contains(n)).collect();
+        serde_json::json!({
+            "requested": self,
+            "applied": used,
+            "not_applied": not_applied,
+        })
+    }
+
+    /// The options SearXNG can apply: all of them.
+    pub fn searxng_applied(&self) -> Vec<&'static str> {
+        vec!["time_range", "language", "safe_search"]
+    }
+
+    /// DuckDuckGo applies a language only through a region ("en-US" → us-en).
+    pub fn duckduckgo_applied(&self) -> Vec<&'static str> {
+        let mut applied = vec!["time_range", "safe_search"];
+        if self.region().is_some() {
+            applied.push("language");
+        }
+        applied
+    }
+}
+
+/// "EN_us" → "en-US". Accepts a 2–3 letter language with an optional 2-letter region.
+fn normalize_language(value: &str) -> Result<String> {
+    let value = value.replace('_', "-");
+    let mut parts = value.split('-');
+    let language = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let region = parts.next().map(str::to_ascii_uppercase);
+    let valid_language = (2..=3).contains(&language.len()) && language.chars().all(|c| c.is_ascii_alphabetic());
+    let valid_region = region
+        .as_ref()
+        .is_none_or(|r| r.len() == 2 && r.chars().all(|c| c.is_ascii_alphabetic()));
+    if !valid_language || !valid_region || parts.next().is_some() {
+        bail!("language must be a language code such as \"en\" or \"en-US\"");
+    }
+    Ok(match region {
+        Some(region) => format!("{language}-{region}"),
+        None => language,
+    })
+}
+
 /// Whether something accepts TCP connections at the URL's host and port.
 /// Used to skip a configured-but-stopped local service (such as SearXNG)
 /// before asking the user to approve a request that could only fail.
@@ -998,6 +1117,16 @@ fn local_snippet(text: &str, lower: &str, terms: &[String]) -> String {
 
 /// Requires a user-configured SearXNG instance with JSON enabled.
 pub fn search_searxng(base_url: &str, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    search_searxng_with(base_url, query, limit, &SearchOptions::default())
+}
+
+/// SearXNG search with its standard `time_range`, `language` and `safesearch` parameters.
+pub fn search_searxng_with(
+    base_url: &str,
+    query: &str,
+    limit: usize,
+    options: &SearchOptions,
+) -> Result<Vec<SearchResult>> {
     if query.trim().is_empty() || query.len() > 4096 {
         bail!("Search query is empty or too long");
     }
@@ -1010,6 +1139,20 @@ pub fn search_searxng(base_url: &str, query: &str, limit: usize) -> Result<Vec<S
     url.query_pairs_mut()
         .append_pair("q", query)
         .append_pair("format", "json");
+    if let Some(range) = &options.time_range {
+        url.query_pairs_mut().append_pair("time_range", range);
+    }
+    if let Some(language) = &options.language {
+        url.query_pairs_mut().append_pair("language", language);
+    }
+    if let Some(level) = &options.safe_search {
+        let value = match level.as_str() {
+            "off" => "0",
+            "strict" => "2",
+            _ => "1",
+        };
+        url.query_pairs_mut().append_pair("safesearch", value);
+    }
     let response = network_client_for(&url)?
         .get(url)
         .send()?
@@ -1122,18 +1265,47 @@ pub fn installed_text_browsers() -> Vec<TextBrowser> {
 
 /// DuckDuckGo's keyless, JavaScript-free results page.
 pub fn duckduckgo_html_url(query: &str) -> Result<url::Url> {
+    duckduckgo_html_url_with(query, &SearchOptions::default())
+}
+
+/// DuckDuckGo's HTML results page: `df` (date), `kl` (region-language, e.g. us-en)
+/// and `kp` (safe search: 1 strict, -1 moderate, -2 off).
+pub fn duckduckgo_html_url_with(query: &str, options: &SearchOptions) -> Result<url::Url> {
     if query.trim().is_empty() || query.len() > 4096 {
         bail!("Search query is empty or too long");
     }
     let mut url = url::Url::parse("https://html.duckduckgo.com/html/").expect("constant URL");
     url.query_pairs_mut().append_pair("q", query.trim());
+    if let Some(range) = &options.time_range {
+        url.query_pairs_mut().append_pair("df", &range[..1]);
+    }
+    if let (Some(language), Some(region)) = (options.language_code(), options.region()) {
+        url.query_pairs_mut()
+            .append_pair("kl", &format!("{}-{language}", region.to_ascii_lowercase()));
+    }
+    if let Some(level) = &options.safe_search {
+        let value = match level.as_str() {
+            "strict" => "1",
+            "off" => "-2",
+            _ => "-1",
+        };
+        url.query_pairs_mut().append_pair("kp", value);
+    }
     Ok(url)
 }
 
 /// The exact non-interactive command: the browser prints the results page
 /// source, which Workbench parses. No shell is involved.
 pub fn text_browser_search_command(browser: &TextBrowser, query: &str) -> Result<CommandSpec> {
-    let url = duckduckgo_html_url(query)?.to_string();
+    text_browser_search_command_with(browser, query, &SearchOptions::default())
+}
+
+pub fn text_browser_search_command_with(
+    browser: &TextBrowser,
+    query: &str,
+    options: &SearchOptions,
+) -> Result<CommandSpec> {
+    let url = duckduckgo_html_url_with(query, options)?.to_string();
     let mut args: Vec<String> = match browser.name.as_str() {
         "lynx" => vec!["-source".into(), "-accept_all_cookies".into()],
         "w3m" => vec!["-dump_source".into()],
@@ -1481,7 +1653,18 @@ pub fn search_text_browser(
     cwd: &Path,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<Vec<SearchResult>> {
-    let spec = text_browser_search_command(browser, query)?;
+    search_text_browser_with(browser, query, limit, cwd, cancel, &SearchOptions::default())
+}
+
+pub fn search_text_browser_with(
+    browser: &TextBrowser,
+    query: &str,
+    limit: usize,
+    cwd: &Path,
+    cancel: Option<Arc<AtomicBool>>,
+    options: &SearchOptions,
+) -> Result<Vec<SearchResult>> {
+    let spec = text_browser_search_command_with(browser, query, options)?;
     let result = run_command_cancellable(&spec, cwd, cancel)?;
     if result.cancelled {
         bail!("{} search was cancelled", browser.name);
@@ -1513,6 +1696,164 @@ pub fn search_text_browser(
         );
     }
     parse_duckduckgo_html(&result.stdout, limit)
+}
+
+/// Reads an MCP search tool's reply into the standard result list. Handles
+/// `structuredContent`, JSON text items (one result or a list, under keys such
+/// as results/web/items), "Title:/URL:/Description:" text blocks, Markdown
+/// links and bare URLs. Duplicate and non-HTTP(S) URLs are dropped.
+pub fn normalize_mcp_search(reply: &Value, limit: usize) -> Vec<SearchResult> {
+    let mut out = Vec::new();
+    if let Some(structured) = reply.get("structuredContent") {
+        collect_search_results(structured, &mut out, 0);
+    }
+    if let Some(items) = reply.get("content").and_then(Value::as_array) {
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                match serde_json::from_str::<Value>(text.trim()) {
+                    Ok(json) if json.is_object() || json.is_array() => {
+                        collect_search_results(&json, &mut out, 0)
+                    }
+                    _ => parse_search_text(text, &mut out),
+                }
+            } else if let Some(resource) = item.get("resource").or(Some(item)) {
+                collect_search_results(resource, &mut out, 0);
+            }
+        }
+    }
+    if out.is_empty() && reply.get("content").is_none() && reply.get("structuredContent").is_none() {
+        collect_search_results(reply, &mut out, 0);
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|r| validate_http_url(&r.url).is_ok() && seen.insert(r.url.clone()));
+    out.truncate(limit.clamp(1, 100));
+    out
+}
+
+/// Plain text from an MCP reply's content items, for when no results could be read.
+pub fn mcp_reply_text(reply: &Value, max_chars: usize) -> String {
+    let text = reply
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_else(|| reply.to_string());
+    text.chars().take(max_chars).collect()
+}
+
+fn collect_search_results(value: &Value, out: &mut Vec<SearchResult>, depth: usize) {
+    if depth > 5 || out.len() >= 200 {
+        return;
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_search_results(item, out, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            let field = |keys: &[&str]| {
+                keys.iter().find_map(|k| map.get(*k).and_then(Value::as_str)).map(str::trim)
+            };
+            if let Some(url) = field(&["url", "link", "href", "uri"]).filter(|u| u.starts_with("http")) {
+                let mut snippet = field(&["description", "snippet", "content", "summary", "text", "body"])
+                    .unwrap_or_default()
+                    .to_owned();
+                if let Some(extra) = map.get("extra_snippets").and_then(Value::as_array) {
+                    for more in extra.iter().filter_map(Value::as_str).take(2) {
+                        snippet.push(' ');
+                        snippet.push_str(more);
+                    }
+                }
+                out.push(SearchResult {
+                    title: strip_tags(field(&["title", "name", "headline"]).unwrap_or_default()),
+                    url: url.to_owned(),
+                    snippet: strip_tags(&snippet).chars().take(4000).collect(),
+                });
+                return;
+            }
+            for (_, child) in map {
+                if child.is_array() || child.is_object() {
+                    collect_search_results(child, out, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_search_text(text: &str, out: &mut Vec<SearchResult>) {
+    let before = out.len();
+    for block in text.split("\n\n") {
+        let mut title = String::new();
+        let mut url = String::new();
+        let mut snippet = String::new();
+        for line in block.lines().map(str::trim) {
+            let lower = line.to_ascii_lowercase();
+            let value = |prefix: &str| line[prefix.len()..].trim().to_owned();
+            if lower.starts_with("title:") {
+                title = value("title:");
+            } else if lower.starts_with("url:") {
+                url = value("url:");
+            } else if lower.starts_with("link:") {
+                url = value("link:");
+            } else if lower.starts_with("description:") {
+                snippet = value("description:");
+            } else if lower.starts_with("snippet:") {
+                snippet = value("snippet:");
+            }
+        }
+        if url.starts_with("http") {
+            out.push(SearchResult { title, url, snippet });
+        }
+    }
+    if out.len() > before {
+        return;
+    }
+    // Markdown links, then bare URLs with the preceding line as the title.
+    let mut previous = "";
+    for line in text.lines().map(str::trim) {
+        if let Some(start) = line.find("](http") {
+            if let (Some(open), Some(close)) = (line[..start].rfind('['), line[start + 2..].find(')')) {
+                let url = &line[start + 2..start + 2 + close];
+                let rest = line[start + 3 + close..].trim_start_matches([' ', '-', ':', '—']).trim();
+                out.push(SearchResult {
+                    title: line[open + 1..start].to_owned(),
+                    url: url.to_owned(),
+                    snippet: rest.to_owned(),
+                });
+            }
+        } else if line.starts_with("http://") || line.starts_with("https://") {
+            let url = line.split_whitespace().next().unwrap_or(line);
+            out.push(SearchResult {
+                title: previous.to_owned(),
+                url: url.to_owned(),
+                snippet: String::new(),
+            });
+        }
+        if !line.is_empty() {
+            previous = line;
+        }
+    }
+}
+
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for c in text.chars() {
+        match c {
+            '<' => inside = true,
+            '>' if inside => inside = false,
+            _ if !inside => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'").trim().to_owned()
 }
 
 /// Parse DuckDuckGo's HTML results page. Ads and non-HTTP(S) links are
@@ -1613,6 +1954,116 @@ fn duckduckgo_destination(href: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_options_are_validated_and_normalized() {
+        let options = SearchOptions::from_args(&serde_json::json!({
+            "time_range":"Week","language":"EN_us","safe_search":"STRICT"
+        }))
+        .unwrap();
+        assert_eq!(options.time_range.as_deref(), Some("week"));
+        assert_eq!(options.language.as_deref(), Some("en-US"));
+        assert_eq!((options.language_code(), options.region()), (Some("en"), Some("US")));
+        assert_eq!(options.safe_search.as_deref(), Some("strict"));
+        assert!(SearchOptions::from_args(&serde_json::json!({"language":""})).unwrap().is_empty());
+        for bad in [
+            serde_json::json!({"time_range":"fortnight"}),
+            serde_json::json!({"safe_search":"high"}),
+            serde_json::json!({"language":"english"}),
+            serde_json::json!({"language":"en-USA"}),
+            serde_json::json!({"time_range":7}),
+        ] {
+            assert!(SearchOptions::from_args(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn duckduckgo_receives_date_region_and_safe_search() {
+        let options = SearchOptions {
+            time_range: Some("month".into()),
+            language: Some("en-GB".into()),
+            safe_search: Some("off".into()),
+        };
+        let url = duckduckgo_html_url_with("rust", &options).unwrap();
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        for expected in [("q", "rust"), ("df", "m"), ("kl", "gb-en"), ("kp", "-2")] {
+            assert!(pairs.contains(&(expected.0.into(), expected.1.into())), "{pairs:?}");
+        }
+        // A language without a region cannot be applied by DuckDuckGo, and says so.
+        let language_only = SearchOptions { language: Some("de".into()), ..Default::default() };
+        assert!(!duckduckgo_html_url_with("rust", &language_only).unwrap().as_str().contains("kl="));
+        let report = language_only.report(&language_only.duckduckgo_applied());
+        assert_eq!(report["not_applied"], serde_json::json!(["language"]));
+        assert_eq!(SearchOptions::default().report(&[]), Value::Null);
+        assert_eq!(duckduckgo_html_url("rust").unwrap(), duckduckgo_html_url_with("rust", &SearchOptions::default()).unwrap());
+    }
+
+    #[test]
+    fn searxng_receives_its_standard_option_parameters() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let n = socket.read(&mut request).unwrap();
+            let body = r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/","content":"A language"}]}"#;
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8_lossy(&request[..n]).lines().next().unwrap_or_default().to_owned()
+        });
+        let options = SearchOptions {
+            time_range: Some("week".into()),
+            language: Some("de-DE".into()),
+            safe_search: Some("strict".into()),
+        };
+        let results = search_searxng_with(&url, "rust", 5, &options).unwrap();
+        assert_eq!(results[0].url, "https://www.rust-lang.org/");
+        let request_line = server.join().unwrap();
+        for part in ["q=rust", "format=json", "time_range=week", "language=de-DE", "safesearch=2"] {
+            assert!(request_line.contains(part), "{request_line}");
+        }
+    }
+
+    #[test]
+    fn mcp_search_replies_become_the_standard_result_list() {
+        let brave_style = serde_json::json!({"content":[
+            {"type":"text","text":"{\"url\":\"https://www.rust-lang.org/\",\"title\":\"Rust <strong>Language</strong>\",\"description\":\"Fast &amp; safe\",\"extra_snippets\":[\"Memory safety\"]}"},
+            {"type":"text","text":"{\"url\":\"https://doc.rust-lang.org/book/\",\"title\":\"The Book\",\"description\":\"Learn Rust\"}"}
+        ]});
+        let results = normalize_mcp_search(&brave_style, 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Rust Language");
+        assert_eq!(results[0].snippet, "Fast & safe Memory safety");
+
+        let structured = serde_json::json!({
+            "structuredContent":{"web":{"results":[{"link":"https://a.example/","title":"A","snippet":"first"}]}},
+            "content":[{"type":"text","text":"[{\"href\":\"https://a.example/\",\"name\":\"A again\"},{\"href\":\"ftp://b.example/\",\"name\":\"not web\"}]"}]
+        });
+        let results = normalize_mcp_search(&structured, 10);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!((results[0].title.as_str(), results[0].snippet.as_str()), ("A", "first"));
+
+        let blocks = serde_json::json!({"content":[{"type":"text","text":
+            "Title: First\nURL: https://one.example/\nDescription: One\n\nTitle: Second\nURL: https://two.example/\nDescription: Two"}]});
+        let results = normalize_mcp_search(&blocks, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!((results[0].title.as_str(), results[0].url.as_str(), results[0].snippet.as_str()), ("First", "https://one.example/", "One"));
+
+        let markdown = serde_json::json!({"content":[{"type":"text","text":
+            "1. [Tokio](https://tokio.rs/) - An async runtime\nSmol\nhttps://github.com/smol-rs/smol"}]});
+        let results = normalize_mcp_search(&markdown, 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!((results[0].title.as_str(), results[0].snippet.as_str()), ("Tokio", "An async runtime"));
+        assert_eq!((results[1].title.as_str(), results[1].url.as_str()), ("Smol", "https://github.com/smol-rs/smol"));
+
+        let unreadable = serde_json::json!({"content":[{"type":"text","text":"No results for that query."}]});
+        assert!(normalize_mcp_search(&unreadable, 10).is_empty());
+        assert_eq!(mcp_reply_text(&unreadable, 100), "No results for that query.");
+    }
 
     fn local_index() -> Value {
         serde_json::json!({"pages": [

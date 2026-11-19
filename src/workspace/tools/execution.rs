@@ -197,6 +197,7 @@ impl ToolEngine {
                 limit,
                 fallbacks,
                 local_sites,
+                options,
             } => {
                 self.require_network()?;
                 if self
@@ -209,26 +210,9 @@ impl ToolEngine {
                 {
                     bail!("Search configuration changed; request a new preview");
                 }
-                // The user's own sites come first: they are focused on the user's
-                // work. A failure here never blocks the web search.
-                let local = local_sites.as_ref().map(|url| {
-                    match integrations::search_local_sites(url, query, *limit) {
-                        Ok(results) => json!({
-                            "source":"Your own sites on the home server (listed before web results)",
-                            "index":url,
-                            "result_count":results.len(),
-                            "results":results,
-                        }),
-                        Err(error) => json!({"index":url,"error":format!("{error:#}")}),
-                    }
-                });
-                let with_local = |mut value: Value| {
-                    if let (Some(local), Some(object)) = (local.clone(), value.as_object_mut()) {
-                        object.insert("local_sites".into(), local);
-                    }
-                    value
-                };
-                let searxng_error = match integrations::search_searxng(base_url, query, *limit) {
+                let local = local_site_results(local_sites.as_deref(), query, *limit);
+                let with_local = |value: Value| with_local_sites(value, &local);
+                let searxng_error = match integrations::search_searxng_with(base_url, query, *limit, options) {
                     Ok(results) => {
                         let note = results.is_empty().then_some(
                             "SearXNG answered and every engine responded, but none found a match.",
@@ -236,9 +220,11 @@ impl ToolEngine {
                         return Ok(with_local(json!({
                             "ok":true,
                             "query":query,
+                            "limit":limit,
                             "provider":{"type":"searxng","server":base_url},
                             "result_count":results.len(),
                             "results":results,
+                            "search_options":options.report(&options.searxng_applied()),
                             "note":note,
                         })));
                     }
@@ -257,21 +243,24 @@ impl ToolEngine {
                     if cancel.load(Ordering::Relaxed) {
                         bail!("Search cancelled");
                     }
-                    match integrations::search_text_browser(
+                    match integrations::search_text_browser_with(
                         browser,
                         query,
                         *limit,
                         self.root(),
                         Some(cancel.clone()),
+                        options,
                     ) {
                         Ok(results) => {
                             return Ok(with_local(json!({
                                 "ok":true,
                                 "query":query,
+                                "limit":limit,
                                 "provider":{"type":"text_browser","browser":browser.name,"search_engine":"duckduckgo","note":"SearXNG failed, so the approved DuckDuckGo fallback answered."},
                                 "failed_providers":failures,
                                 "result_count":results.len(),
                                 "results":results,
+                                "search_options":options.report(&options.duckduckgo_applied()),
                             })));
                         }
                         Err(error) => failures.push(format!("{}: {error:#}", browser.name)),
@@ -287,10 +276,12 @@ impl ToolEngine {
                     return Ok(with_local(json!({
                         "ok":true,
                         "query":query,
+                        "limit":limit,
                         "note":"Every web search provider failed; only your own sites answered.",
                         "failed_providers":failures,
                         "result_count":0,
                         "results":[],
+                        "search_options":options.report(&[]),
                     })));
                 }
                 bail!(
@@ -305,8 +296,14 @@ impl ToolEngine {
                 limit,
                 fallbacks,
                 knowledge_fallback,
+                options,
+                local_sites,
             } => {
                 self.require_network()?;
+                if self.local_sites_url()? != *local_sites {
+                    bail!("Search configuration changed; request a new preview");
+                }
+                let local = local_site_results(local_sites.as_deref(), query, *limit);
                 let configured = self.configured_text_browser()?;
                 let Some(configured) = configured.filter(|configured| {
                     configured.name == *browser
@@ -332,15 +329,16 @@ impl ToolEngine {
                     if cancel.load(Ordering::Relaxed) {
                         bail!("Search cancelled");
                     }
-                    match integrations::search_text_browser(
+                    match integrations::search_text_browser_with(
                         &candidate,
                         query,
                         *limit,
                         self.root(),
                         Some(cancel.clone()),
+                        options,
                     ) {
                         Ok(results) => {
-                            return Ok(json!({
+                            return Ok(with_local_sites(json!({
                                 "ok":true,
                                 "query":query,
                                 "limit":limit,
@@ -348,7 +346,8 @@ impl ToolEngine {
                                 "failed_browsers":failures,
                                 "result_count":results.len(),
                                 "results":results,
-                            }));
+                                "search_options":options.report(&options.duckduckgo_applied()),
+                            }), &local));
                         }
                         Err(error) => failures.push(format!("{}: {error:#}", candidate.name)),
                     }
@@ -363,7 +362,7 @@ impl ToolEngine {
                         .clone();
                     match crate::knowledge_search::search(&endpoints, query, knowledge_fallback, *limit) {
                         Ok(found) => {
-                            return Ok(json!({
+                            return Ok(with_local_sites(json!({
                                 "ok":true,
                                 "query":query,
                                 "limit":limit,
@@ -372,7 +371,8 @@ impl ToolEngine {
                                 "result_count":found.results.len(),
                                 "results":found.results,
                                 "source_reports":found.reports,
-                            }));
+                                "search_options":options.report(&[]),
+                            }), &local));
                         }
                         Err(error) => bail!(
                             "Every text browser failed: {}; the public knowledge sources also failed: {error:#}",
@@ -386,6 +386,7 @@ impl ToolEngine {
                 query,
                 sources,
                 limit,
+                options,
             } => {
                 self.require_network()?;
                 self.check_knowledge_sources(sources)
@@ -404,6 +405,7 @@ impl ToolEngine {
                     "result_count":found.results.len(),
                     "results":found.results,
                     "source_reports":found.reports,
+                    "search_options":options.report(&[]),
                 }))
             }
             Operation::QaLookup {
@@ -513,10 +515,16 @@ impl ToolEngine {
                 limit,
                 arguments,
                 config_hash,
+                local_sites,
+                options,
+                applied_options,
             } => {
                 self.require_network()?;
                 let config = self.mcp_config(server_id)?;
-                if !config.enabled || hash(&serde_json::to_vec(&config)?) != *config_hash {
+                if !config.enabled
+                    || hash(&serde_json::to_vec(&config)?) != *config_hash
+                    || self.local_sites_url()? != *local_sites
+                {
                     bail!("MCP search configuration changed or is disabled; request a new preview");
                 }
                 let mapping = config
@@ -557,21 +565,36 @@ impl ToolEngine {
                 let result =
                     client.call_tool_cancellable(tool_name, arguments.clone(), cancel.clone())?;
                 let ok = result.get("isError").and_then(Value::as_bool) != Some(true);
-                Ok(json!({
-                    "ok":ok,
-                    "query":query,
-                    "limit":limit,
-                    "provider":{
-                        "type":"mcp",
-                        "server_id":server_id,
-                        "server_name":config.name,
-                        "tool":tool_name,
-                    },
-                    "results":result,
-                }))
+                // The same result list as every other provider; the provider's own
+                // text is kept only when nothing could be read from it.
+                let results = integrations::normalize_mcp_search(&result, *limit);
+                let raw_text = (results.is_empty() || !ok)
+                    .then(|| integrations::mcp_reply_text(&result, 8_000));
+                let applied: Vec<&str> = applied_options.iter().map(String::as_str).collect();
+                let local = local_site_results(local_sites.as_deref(), query, *limit);
+                Ok(with_local_sites(
+                    json!({
+                        "ok":ok,
+                        "query":query,
+                        "limit":limit,
+                        "provider":{
+                            "type":"mcp",
+                            "server_id":server_id,
+                            "server_name":config.name,
+                            "tool":tool_name,
+                        },
+                        "result_count":results.len(),
+                        "results":results,
+                        "search_options":options.report(&applied),
+                        "provider_text":raw_text,
+                        "note":(ok && results.is_empty() && raw_text.as_deref().is_some_and(|t| !t.trim().is_empty()))
+                            .then_some("The provider's reply could not be read as a result list; its text is in provider_text."),
+                    }),
+                    &local,
+                ))
             }
             Operation::McpConnect { config } => {
-                if self.mcp_config(&config.id)? != *config || !config.enabled {
+                if self.mcp_config(&config.id)? != **config || !config.enabled {
                     bail!("MCP configuration changed or is disabled");
                 }
                 let client =
@@ -701,4 +724,24 @@ impl ToolEngine {
             .insert(config.id.clone(), client.clone());
         Ok(client)
     }
+}
+
+/// The user's own sites, searched before the web. A failure here never blocks the web search.
+fn local_site_results(local_sites: Option<&str>, query: &str, limit: usize) -> Option<Value> {
+    local_sites.map(|url| match integrations::search_local_sites(url, query, limit) {
+        Ok(results) => json!({
+            "source":"Your own sites on the home server (listed before web results)",
+            "index":url,
+            "result_count":results.len(),
+            "results":results,
+        }),
+        Err(error) => json!({"index":url,"error":format!("{error:#}")}),
+    })
+}
+
+fn with_local_sites(mut value: Value, local: &Option<Value>) -> Value {
+    if let (Some(local), Some(object)) = (local.clone(), value.as_object_mut()) {
+        object.insert("local_sites".into(), local);
+    }
+    value
 }
