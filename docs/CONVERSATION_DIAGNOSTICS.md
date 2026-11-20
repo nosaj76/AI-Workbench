@@ -42,6 +42,23 @@ The command prints counts, the JSONL location, and the readable brief. Existing
 archived chats are included. Live saves inspect the latest user turn; historical
 scans retain up to 128 findings per chat, favouring its most recent findings.
 
+## Self-review team
+
+The rules above catch observable failures. To judge whether answers actually
+delivered what was asked, and to get suggested fixes, run a self-review:
+
+- **Agents → Self-review → Review recent conversations**, or
+- `ollama-workbench --self-review [N]` (default 3, at most 7 conversations).
+
+It uses the agents framework with a fixed plan: one read-only reviewer per
+conversation, given a digest Workbench writes from the saved transcript (each
+user request, tool call and outcome, stop reason and prompt size) plus that
+chat's diagnostic incidents. When this build's source tree is present, one more
+reviewer reads the Workbench code behind the incidents and proposes code or
+prompt changes with file:line citations. A synthesis pass ranks the
+recommendations. Runs are saved under **Saved teams and recovery** like any
+team. Nothing is edited, and suggestions are model output to be checked.
+
 ## Detection rules
 
 | Code | Meaning | Evidence class |

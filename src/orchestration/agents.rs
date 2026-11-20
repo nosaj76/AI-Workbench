@@ -70,7 +70,16 @@ pub struct AgentRequest {
     pub allow_actions: bool,
     /// Resume a saved run from this data directory. Completed children are kept.
     pub resume_id: Option<String>,
+    /// A plan fixed by the application, as (title, instruction) pairs. When set,
+    /// the planner model is skipped and these become the child tasks. Used by
+    /// built-in teams such as the self-review, whose tasks carry evidence the
+    /// planner would otherwise have to copy through a JSON round trip.
+    pub planned_tasks: Vec<(String, String)>,
 }
+
+/// Longest instruction an application-fixed task may carry. Larger than the
+/// planner's 6,000-character limit because fixed tasks embed their evidence.
+pub const MAX_PLANNED_TASK_CHARS: usize = 24_000;
 
 impl AgentRequest {
     pub fn new(
@@ -95,6 +104,7 @@ impl AgentRequest {
             depth: 1,
             allow_actions: false,
             resume_id: None,
+            planned_tasks: vec![],
         }
     }
 
@@ -121,6 +131,16 @@ impl AgentRequest {
             || self.depth > self.max_depth
         {
             bail!("Agent task, concurrency or delegation-depth budget is invalid");
+        }
+        if self.planned_tasks.len() > self.max_agents
+            || self.planned_tasks.iter().any(|(title, prompt)| {
+                title.trim().is_empty()
+                    || title.chars().count() > 160
+                    || prompt.trim().is_empty()
+                    || prompt.chars().count() > MAX_PLANNED_TASK_CHARS
+            })
+        {
+            bail!("A fixed agent plan needs 1–{} tasks with short titles and bounded instructions", self.max_agents);
         }
         if let Some(root) = &self.workspace {
             crate::files::Workspace::new(root.clone())?;
@@ -457,6 +477,32 @@ fn execute(
         }
     }
     let request = &effective;
+    if state.tasks.is_empty() && !request.planned_tasks.is_empty() {
+        status(tx, "Using the application's fixed task plan");
+        state.tasks = request
+            .planned_tasks
+            .iter()
+            .enumerate()
+            .map(|(index, (title, prompt))| AgentTask {
+                id: uuid::Uuid::new_v4().to_string(),
+                title: title.clone(),
+                prompt: prompt.clone(),
+                model: models[index % models.len()].clone(),
+                routing_reason: String::new(),
+                dedicated_translation: false,
+                state: "queued".into(),
+                answer: String::new(),
+                error: None,
+                sources: vec![],
+                trace: vec![],
+                trace_truncated: false,
+                denied_actions: 0,
+                elapsed_ms: 0,
+            })
+            .collect();
+        state.state = "running".into();
+        persist_run(&request.data_dir, state)?;
+    }
     if state.tasks.is_empty() {
         status(tx, "Planning independent child tasks");
         let prompt = format!(

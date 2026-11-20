@@ -76,6 +76,10 @@ pub mod retrieval;
 #[path = "workspace/review_queue.rs"]
 pub mod review_queue;
 
+/// Workbench reviews its own recent conversations (and optionally its code).
+#[path = "orchestration/self_review.rs"]
+pub mod self_review;
+
 #[path = "inference/routing.rs"]
 pub mod routing;
 

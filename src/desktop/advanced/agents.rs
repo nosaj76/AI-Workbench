@@ -63,6 +63,45 @@ impl AdvancedUi {
                 }
             }
         });
+        ui.separator();
+        ui.strong("Self-review");
+        ui.label("A read-only team reviews your newest conversations for workflow problems and incomplete answers, and suggests improvements to Workbench. Each conversation gets its own reviewer; an optional reviewer reads Workbench's source to explain how the problems arise. Nothing is changed.");
+        let source = crate::self_review::default_source_root();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Conversations");
+            ui.add(
+                egui::DragValue::new(&mut self.self_review_count)
+                    .range(1..=crate::self_review::MAX_CONVERSATIONS),
+            );
+            ui.add_enabled(
+                source.is_some(),
+                egui::Checkbox::new(&mut self.self_review_code, "Also review Workbench's code"),
+            )
+            .on_hover_text(source.as_ref().map_or_else(
+                || "This build's source tree is not on this computer".to_string(),
+                |root| format!("Reads {}", root.display()),
+            ));
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Review recent conversations"))
+                .clicked()
+            {
+                let settings = settings.clone();
+                let dir = self.dir.clone();
+                let count = self.self_review_count;
+                let source = source.filter(|_| self.self_review_code);
+                self.start("Reviewing recent conversations…", move |tx, cancel| {
+                    let sessions = {
+                        let store = crate::storage::Store::open(&dir)?;
+                        crate::self_review::recent_sessions(&store, count)?
+                    };
+                    let model = settings.active_model().to_string();
+                    let request =
+                        crate::self_review::request(&settings, &dir, &sessions, source, model)?;
+                    let run = crate::agents::run(request, tx, cancel)?;
+                    Ok((run.report(), vec![]))
+                });
+            }
+        });
         egui::CollapsingHeader::new("Saved teams and recovery").show(ui, |ui| {
             let mut load = None;
             for run in &self.history {

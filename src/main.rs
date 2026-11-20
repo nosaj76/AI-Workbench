@@ -11,7 +11,7 @@ fn main() {
 fn run() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("AI Workbench — native Rust desktop AI workspace for local models (works with Ollama)\n\nUsage: ollama-workbench [--demo] [--data-dir PATH] [--check] [--doctor] [--daemon] [--diagnose-conversations]\n\n  --demo           Labeled UI preview with sample content; no model requests\n  --data-dir PATH  Use an explicit local data directory\n  --check          Check configuration and local Ollama connectivity, then exit\n  --doctor         Inspect configuration and optional program availability (no network)\n  --daemon         Run the persistent scheduler without a desktop window\n  --diagnose-conversations  Scan saved chats and write local failure diagnostics\n  --benchmark-models  Calibrate installed local text models (no tools execute)\n  --benchmark-model NAME  Calibrate one model; repeat for a selection\n  --version        Show application version\n\nThe application opens a native desktop window. It does not start an HTTP server.\nDefault endpoint: http://127.0.0.1:11434");
+        println!("AI Workbench — native Rust desktop AI workspace for local models (works with Ollama)\n\nUsage: ollama-workbench [--demo] [--data-dir PATH] [--check] [--doctor] [--daemon] [--diagnose-conversations] [--self-review [N]]\n\n  --demo           Labeled UI preview with sample content; no model requests\n  --data-dir PATH  Use an explicit local data directory\n  --check          Check configuration and local Ollama connectivity, then exit\n  --doctor         Inspect configuration and optional program availability (no network)\n  --daemon         Run the persistent scheduler without a desktop window\n  --diagnose-conversations  Scan saved chats and write local failure diagnostics\n  --self-review [N]  Agent team reviews the N newest chats (default 3) for workflow problems and suggests improvements; reads this build's source when present\n  --benchmark-models  Calibrate installed local text models (no tools execute)\n  --benchmark-model NAME  Calibrate one model; repeat for a selection\n  --version        Show application version\n\nThe application opens a native desktop window. It does not start an HTTP server.\nDefault endpoint: http://127.0.0.1:11434");
         return Ok(());
     }
     if args.iter().any(|a| a == "--version") {
@@ -27,6 +27,7 @@ fn run() -> Result<()> {
     let mut daemon = false;
     let mut doctor = false;
     let mut diagnose = false;
+    let mut self_review: Option<usize> = None;
     let mut benchmark = false;
     let mut benchmark_models = Vec::new();
     let mut dir = None;
@@ -50,6 +51,22 @@ fn run() -> Result<()> {
             "--daemon" => daemon = true,
             "--doctor" => doctor = true,
             "--diagnose-conversations" => diagnose = true,
+            "--self-review" => {
+                let count = match args.get(i + 1).and_then(|n| n.parse::<usize>().ok()) {
+                    Some(n) => {
+                        i += 1;
+                        n
+                    }
+                    None => 3,
+                };
+                if !(1..=ollama_workbench::self_review::MAX_CONVERSATIONS).contains(&count) {
+                    anyhow::bail!(
+                        "--self-review takes 1–{} conversations",
+                        ollama_workbench::self_review::MAX_CONVERSATIONS
+                    );
+                }
+                self_review = Some(count);
+            }
             "--data-dir" => {
                 i += 1;
                 dir =
@@ -61,14 +78,14 @@ fn run() -> Result<()> {
         };
         i += 1;
     }
-    if [demo, check, daemon, doctor, diagnose, benchmark]
+    if [demo, check, daemon, doctor, diagnose, benchmark, self_review.is_some()]
         .into_iter()
         .filter(|enabled| *enabled)
         .count()
         > 1
     {
         anyhow::bail!(
-            "Choose only one of --demo, --check, --doctor, --daemon, --diagnose-conversations or --benchmark-model(s)"
+            "Choose only one of --demo, --check, --doctor, --daemon, --diagnose-conversations, --self-review or --benchmark-model(s)"
         );
     }
     let dir = match dir {
@@ -100,6 +117,52 @@ fn run() -> Result<()> {
         let (sessions, incidents) = store.scan_conversation_diagnostics()?;
         println!("Reviewed {sessions} saved conversations; {incidents} new or updated incidents.\nLog: {}\n\n{}",
             ollama_workbench::conversation_diagnostics::log_path(&dir).display(), store.conversation_diagnostic_report()?);
+        return Ok(());
+    }
+    if let Some(count) = self_review {
+        let config = settings::Settings::load(&dir)?;
+        let store = ollama_workbench::storage::Store::open(&dir)?;
+        let sessions = ollama_workbench::self_review::recent_sessions(&store, count)?;
+        drop(store);
+        let source = ollama_workbench::self_review::default_source_root();
+        eprintln!(
+            "Reviewing {} conversation(s){}",
+            sessions.len(),
+            source.as_ref().map_or(String::new(), |root| format!(
+                " and source code at {}",
+                root.display()
+            ))
+        );
+        let request = ollama_workbench::self_review::request(
+            &config,
+            &dir,
+            &sessions,
+            source,
+            config.active_model().into(),
+        )?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let printer = std::thread::spawn(move || {
+            for event in rx {
+                match event {
+                    ollama_workbench::agents::AgentEvent::Status(text) => eprintln!("{text}"),
+                    ollama_workbench::agents::AgentEvent::Task { title, state, message, .. } => {
+                        eprintln!("[{state}] {title}: {message}")
+                    }
+                    // Read-only teams never request approvals; refuse if one arrives.
+                    ollama_workbench::agents::AgentEvent::Approval { reply, .. } => {
+                        let _ = reply.send(false);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let run = ollama_workbench::agents::run(
+            request,
+            tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?;
+        let _ = printer.join();
+        println!("{}", run.report());
         return Ok(());
     }
     if doctor {
