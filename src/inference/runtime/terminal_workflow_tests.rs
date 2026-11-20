@@ -436,6 +436,47 @@ fn how_to_question_does_not_require_a_launch_or_a_workspace() {
 }
 
 #[test]
+#[cfg(unix)]
+fn delegated_child_quoting_terminal_commands_keeps_its_answer() {
+    // A self-review child's task quotes a conversation that used the terminal.
+    // That quote is evidence, not an instruction to drive a CLI.
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let server = MockOllama::start(|round, _| {
+        assert_eq!(round, 0, "a delegated child must not be pushed into a terminal retry");
+        answer("The conversation retried terminal_write after the shell exited.")
+    });
+    let mut request = job(
+        &server.endpoint,
+        "Review this digest: [15] CALL terminal_write({\"text\":\"modernbasic repl\"}) — user said: use modern basic",
+        data.path(),
+        Some(engine(workspace.path(), data.path())),
+    );
+    request.settings.delegated_task = true;
+    let transcript = chat(request, true);
+    assert_eq!(server.finish().len(), 1);
+    assert!(transcript.errors.is_empty(), "{:?}", transcript.errors);
+    assert!(transcript.superseded.is_empty(), "{:?}", transcript.superseded);
+    assert!(transcript
+        .complete
+        .last()
+        .unwrap()
+        .content
+        .contains("retried terminal_write"));
+
+    // Without tools (no workspace), the child must still start rather than
+    // fail with "Interactive CLI cannot start".
+    let mut offline = job("http://127.0.0.1:1", "use modern basic", data.path(), None);
+    offline.settings.delegated_task = true;
+    offline.settings.tools_enabled = false;
+    let transcript = chat(offline, true);
+    assert!(transcript
+        .errors
+        .iter()
+        .all(|error| !error.contains("Interactive CLI cannot start")), "{:?}", transcript.errors);
+}
+
+#[test]
 fn explicit_cli_setup_failures_are_reported_before_contacting_a_model() {
     let data = tempfile::tempdir().unwrap();
     for tools_enabled in [false, true] {

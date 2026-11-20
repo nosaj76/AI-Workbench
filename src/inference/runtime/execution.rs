@@ -30,7 +30,12 @@ pub(super) async fn run_chat(
         .map(|m| crate::memory::user_text(&m.content))
         .unwrap_or_default();
     let explicit_web_search = explicitly_requests_web_search(&memory_user);
-    let terminal_request = (!explicit_web_search)
+    // A delegated child's task is written by a planner or by Workbench and may
+    // quote terminal commands as evidence (the self-review digests whole
+    // conversations). Enforcing a terminal action there would discard the
+    // child's real answer, or refuse to start a read-only child; children keep
+    // their own orchestration rules, as for review evidence below.
+    let terminal_request = (!explicit_web_search && !job.settings.delegated_task)
         .then(|| terminal_action_for_turn(&job.messages))
         .flatten()
         .filter(|kind| {
@@ -865,6 +870,9 @@ pub(super) async fn run_chat(
         .into_iter()
         .map(|url| comparable_url(&url))
         .collect();
+    // Tokens the character-based budget plans with; calibrated each round from
+    // Ollama's measured prompt size (see context::calibrated_budget_ctx).
+    let mut budget_ctx = context::remembered_budget_ctx(&job.model, job.settings.num_ctx);
     for round in 0..=limit {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -901,14 +909,14 @@ pub(super) async fn run_chat(
         let fitted = if let Some(continuation) = &answer_continuation {
             continuation.fit_request(
                 source_messages,
-                job.settings.num_ctx,
+                budget_ctx,
                 job.settings.num_predict,
                 tool_chars,
             )
         } else {
             context::fit_context_for_tool_round(
                 source_messages,
-                job.settings.num_ctx,
+                budget_ctx,
                 job.settings.num_predict,
                 tool_chars,
             )
@@ -941,7 +949,7 @@ pub(super) async fn run_chat(
                     &mut trimmed,
                     &definitions,
                     terminal_request.expect("terminal recovery has an explicit request"),
-                    job.settings.num_ctx,
+                    budget_ctx,
                     job.settings.num_predict,
                 ) {
                     terminal_not_performed(
@@ -955,7 +963,7 @@ pub(super) async fn run_chat(
                     &mut trimmed,
                     &definitions,
                     terminal_request,
-                    job.settings.num_ctx,
+                    budget_ctx,
                     job.settings.num_predict,
                 );
             }
@@ -1064,6 +1072,29 @@ pub(super) async fn run_chat(
         // Never retain the model permit while tools, approvals or delegated
         // children run: their own inference must be able to acquire it.
         drop(permit);
+        if let Some(prompt_tokens) = response_stats
+            .get("prompt_eval_count")
+            .and_then(Value::as_u64)
+        {
+            let window_full = response_stats.get("done_reason").and_then(Value::as_str)
+                == Some("length")
+                && prompt_tokens + 64 >= u64::from(options.num_ctx);
+            let calibrated = context::calibrated_budget_ctx(
+                job.settings.num_ctx,
+                budget_ctx,
+                context::request_chars(&trimmed, tool_chars),
+                prompt_tokens,
+                window_full,
+            );
+            if calibrated < budget_ctx && (window_full || calibrated < budget_ctx * 9 / 10) {
+                let _ = tx.send(ChatEvent::Status(format!(
+                    "Context budget: this conversation uses more tokens per character than estimated; planning with {calibrated} of {} tokens so the model keeps room to answer.",
+                    job.settings.num_ctx
+                )));
+            }
+            budget_ctx = calibrated;
+            context::remember_budget_ctx(&job.model, job.settings.num_ctx, budget_ctx);
+        }
         // A reply stuck repeating the same lines is stopped where the loop began;
         // the repeats are removed and the reply says what happened.
         let response = match loop_cut {
@@ -1102,6 +1133,7 @@ pub(super) async fn run_chat(
                 )));
                 options.num_ctx = reduced;
                 job.settings.num_ctx = reduced;
+                budget_ctx = budget_ctx.min(reduced);
                 continue;
             }
             Err(error)
@@ -1894,7 +1926,7 @@ pub(super) async fn run_chat(
                 if matches!(function.name.as_str(), "read_file" | "fetch_url") {
                     let view = context::tool_result_room(
                         &messages,
-                        job.settings.num_ctx,
+                        budget_ctx,
                         job.settings.num_predict,
                         tool_chars,
                     );
@@ -1909,7 +1941,7 @@ pub(super) async fn run_chat(
                 ) {
                     let view = context::tool_result_room(
                         &messages,
-                        job.settings.num_ctx,
+                        budget_ctx,
                         job.settings.num_predict,
                         tool_chars,
                     );
@@ -2129,7 +2161,7 @@ pub(super) async fn run_chat(
                 &result,
                 context::tool_result_room(
                     &messages,
-                    job.settings.num_ctx,
+                    budget_ctx,
                     job.settings.num_predict,
                     tool_chars,
                 ),

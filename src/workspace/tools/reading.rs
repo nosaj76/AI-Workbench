@@ -338,6 +338,28 @@ impl ToolEngine {
         let warning = regex_like.then(|| {
             "The query contains regular-expression syntax (such as | alternation) but was matched as LITERAL text, so these results do not reflect the pattern you meant. Repeat with \"regex\": true, or run one search per alternative.".to_string()
         });
+        // Small models routinely write `a|b|c` without regex:true. A literal
+        // miss then costs a whole tool round and often derails the turn, so
+        // rerun such a query as the pattern it plainly is. An explicit
+        // regex:false is the model's choice and is honoured.
+        if matches.is_empty()
+            && regex_like
+            && args.get("regex").is_none()
+            && regex::RegexBuilder::new(&query)
+                .size_limit(1 << 20)
+                .build()
+                .is_ok()
+        {
+            let mut retry = args.clone();
+            retry["regex"] = Value::Bool(true);
+            if let Ok(mut result) = self.search(&retry) {
+                result["automatic_regex"] = Value::Bool(true);
+                result["warning"] = Value::String(
+                    "The literal query had no matches and contains regular-expression syntax, so it was run again as a regular expression (regex:true). These results are for the pattern.".into(),
+                );
+                return Ok(result);
+            }
+        }
         let coverage = match &warning {
             Some(w) if matches.is_empty() => format!("NOT CONCLUSIVE: {w} {coverage}"),
             Some(w) => format!("{w} {coverage}"),

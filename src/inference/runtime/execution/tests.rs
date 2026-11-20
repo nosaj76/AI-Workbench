@@ -809,6 +809,41 @@ mod finalization_tests {
         assert!(report.contains("1 duplicate/skipped request"));
         assert!(report.contains("None recorded"));
     }
+
+    #[test]
+    fn unfinished_creative_request_is_not_called_a_review_and_open_ranges_read_as_end() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "write a new song using a classic composition".into(),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                tool_calls: vec![crate::ollama::ToolCall {
+                    function: crate::ollama::FunctionCall {
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path":"song.py"}),
+                    },
+                }],
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "tool".into(),
+                tool_name: Some("read_file".into()),
+                content: serde_json::json!({"path":"song.py", "requested_start_line":1,
+                    "requested_end_line":u64::MAX, "content":"x = 1"})
+                .to_string(),
+                ..Default::default()
+            },
+        ];
+        let report = incomplete_review_report(&messages, 32, "context full");
+        assert!(report.contains("Answer incomplete"), "{report}");
+        assert!(!report.contains("code review"), "{report}");
+        assert!(report.contains("after 1 tool round(s) (limit 32)"), "{report}");
+        assert!(report.contains("lines 1–end"), "{report}");
+        assert!(!report.contains(&u64::MAX.to_string()), "{report}");
+    }
 }
 
 #[cfg(test)]

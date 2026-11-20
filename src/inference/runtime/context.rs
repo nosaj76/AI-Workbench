@@ -1548,3 +1548,102 @@ mod tests {
         );
     }
 }
+
+/// Characters in a request as the budget estimator counts them.
+pub(super) fn request_chars(messages: &[ChatMessage], tool_chars: usize) -> usize {
+    messages.iter().map(message_cost).sum::<usize>() + tool_chars
+}
+
+/// The budget estimator assumes about three characters per token. Code read as
+/// JSON-escaped text, box-drawing characters and non-Latin scripts run far
+/// denser: a 20 KB analysis file measured ~13,800 tokens. Ollama then silently
+/// cuts the front of an over-long prompt and leaves no room to answer
+/// (`done_reason: length` with no text). Measure instead of assuming: after
+/// each reply, the reported prompt token count gives the real density, and the
+/// estimator plans against a context scaled to match it.
+///
+/// Returns the token count to give the char-based budget functions in place of
+/// `num_ctx` (never more than `num_ctx`). `window_full` means Ollama truncated
+/// the prompt, so the measured count is only a lower bound: shrink further.
+pub(super) fn calibrated_budget_ctx(
+    num_ctx: u32,
+    current: u32,
+    sent_chars: usize,
+    prompt_tokens: u64,
+    window_full: bool,
+) -> u32 {
+    const ASSUMED_CHARS_PER_TOKEN: f64 = 3.0;
+    let floor = (num_ctx / 4).max(1024).min(num_ctx);
+    let mut target = f64::from(num_ctx);
+    if prompt_tokens > 0 && sent_chars > 0 {
+        let observed = sent_chars as f64 / prompt_tokens as f64;
+        if observed < ASSUMED_CHARS_PER_TOKEN {
+            // 10% margin: the next round adds new, unmeasured text.
+            target = f64::from(num_ctx) * observed / ASSUMED_CHARS_PER_TOKEN * 0.9;
+        }
+    }
+    if window_full {
+        target = target.min(f64::from(current) * 0.75);
+    }
+    (target as u32).clamp(floor, num_ctx)
+}
+
+static BUDGET_FACTORS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, f64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The last calibration for a model, as a fraction of its context, so the
+/// first round of the next turn does not overflow the same way again.
+pub(super) fn remembered_budget_ctx(model: &str, num_ctx: u32) -> u32 {
+    let factor = BUDGET_FACTORS
+        .lock()
+        .ok()
+        .and_then(|factors| factors.get(model).copied())
+        .unwrap_or(1.0);
+    ((f64::from(num_ctx) * factor) as u32).clamp((num_ctx / 4).max(1024).min(num_ctx), num_ctx)
+}
+
+pub(super) fn remember_budget_ctx(model: &str, num_ctx: u32, budget_ctx: u32) {
+    if num_ctx == 0 {
+        return;
+    }
+    if let Ok(mut factors) = BUDGET_FACTORS.lock() {
+        factors.insert(model.to_string(), f64::from(budget_ctx) / f64::from(num_ctx));
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+
+    #[test]
+    fn dense_prompts_shrink_the_planning_context() {
+        // 60k chars measured as 30k tokens: 2 chars/token, not 3.
+        let ctx = calibrated_budget_ctx(32768, 32768, 60_000, 30_000, false);
+        assert!(ctx < 32768 * 2 / 3, "{ctx}");
+        assert!(ctx >= 32768 / 4);
+    }
+
+    #[test]
+    fn prose_at_or_above_the_assumed_density_keeps_the_full_context() {
+        assert_eq!(calibrated_budget_ctx(32768, 20000, 40_000, 10_000, false), 32768);
+    }
+
+    #[test]
+    fn a_truncated_prompt_always_shrinks_and_never_below_the_floor() {
+        let first = calibrated_budget_ctx(32768, 32768, 90_000, 32766, true);
+        assert!(first < 32768 * 3 / 4 + 1, "{first}");
+        let mut ctx = first;
+        for _ in 0..20 {
+            ctx = calibrated_budget_ctx(32768, ctx, 90_000, 32766, true);
+        }
+        assert_eq!(ctx, 32768 / 4);
+    }
+
+    #[test]
+    fn a_calibration_is_remembered_per_model() {
+        remember_budget_ctx("calibration-test-model", 32768, 16384);
+        assert_eq!(remembered_budget_ctx("calibration-test-model", 32768), 16384);
+        assert_eq!(remembered_budget_ctx("calibration-other-model", 32768), 32768);
+    }
+}

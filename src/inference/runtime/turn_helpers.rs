@@ -903,8 +903,14 @@ pub(super) fn incomplete_review_report(
         if limited {
             partial += 1;
         }
+        // An open-ended read asks for lines 1..u64::MAX; never print that.
+        let range = if last >= u64::from(u32::MAX) {
+            format!("lines {first}–end")
+        } else {
+            format!("lines {first}–{last}")
+        };
         opened.insert(format!(
-            "`{path}` (requested lines {first}–{last}{})",
+            "`{path}` (requested {range}{})",
             if limited { ", partial result" } else { "" }
         ));
     }
@@ -918,12 +924,35 @@ pub(super) fn incomplete_review_report(
             "## Web search incomplete\n\n{reason}\n\nWorkbench recorded {result_count} successful tool result(s), {failures} denied/failed result(s), and {skipped} skipped request(s) in this turn. This is an application status report, not a researched answer.\n\nInspect the web_search/fetch_url results above for provider errors or returned sources. A local directory listing is not a web search. Search requires Tools, network access, and an enabled configured provider; these settings are not enabled automatically."
         );
     }
+    let rounds = messages
+        .iter()
+        .skip(current_start)
+        .filter(|message| message.role == "assistant" && !message.tool_calls.is_empty())
+        .count();
+    let review = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .is_some_and(|message| {
+            let lower = crate::memory::user_text(&message.content).to_ascii_lowercase();
+            requests_project_review(&message.content)
+                || ["review", "audit", "inspect", "examine", "analyze", "analyse"]
+                    .iter()
+                    .any(|verb| lower.contains(verb))
+        });
+    // Only a review request gets the review wording. Writing a song or a
+    // program that stops early is an unfinished answer, not a failed review.
+    let (heading, product) = if review {
+        ("Review incomplete — tool use stopped", "code review")
+    } else {
+        ("Answer incomplete — tool use stopped", "answer")
+    };
     let mut text = format!(
-        "## Review incomplete — tool use stopped\n\n\
+        "## {heading}\n\n\
         {reason}\n\n\
-        Workbench stopped further tool use at or before the configured limit of {limit} rounds without obtaining a final model review. \
+        Workbench stopped after {rounds} tool round(s) (limit {limit}) without obtaining a final model {product}. \
         It recorded {result_count} successful tool result(s), {failures} denied/failed result(s), and {skipped} duplicate/skipped request(s). \
-        This is a progress report from the application, **not a model-generated code review**.\n\n"
+        This is a progress report from the application, **not a model-generated {product}**.\n\n"
     );
     if opened.is_empty() {
         text.push_str("**File contents verified:** None recorded through a successful `read_file` result in this turn.\n\n");
@@ -945,7 +974,11 @@ pub(super) fn incomplete_review_report(
     if partial > 0 {
         text.push_str(&format!("**Partial reads:** At least {partial} tool result(s) were marked truncated or context-limited.\n\n"));
     }
-    text.push_str("**Next step:** Use **Activities → Review queue** for a complete, checkpointed project review, or ask a smaller question about an explicitly named file. Tool results remain available in this conversation; no additional file changes were authorized by this report.");
+    if review {
+        text.push_str("**Next step:** Use **Activities → Review queue** for a complete, checkpointed project review, or ask a smaller question about an explicitly named file. Tool results remain available in this conversation; no additional file changes were authorized by this report.");
+    } else {
+        text.push_str("**Next step:** Reply \"continue\" to retry with the evidence gathered so far, ask for a smaller piece (one file, section or step), or start a new chat if this one has grown long. Tool results remain available in this conversation; no additional file changes were authorized by this report.");
+    }
     text
 }
 
