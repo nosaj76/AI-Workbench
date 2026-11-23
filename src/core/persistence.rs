@@ -69,7 +69,7 @@ pub(crate) fn write_atomic_with(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut file = options.open(&temporary)?;
         write(&mut file)?;
@@ -77,7 +77,14 @@ pub(crate) fn write_atomic_with(
         drop(file);
         fs::rename(&temporary, path)?;
         #[cfg(unix)]
-        fs::File::open(parent)?.sync_all()?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| {
+                format!(
+                    "{} was replaced, but directory durability could not be confirmed",
+                    path.display()
+                )
+            })?;
         Ok(())
     })();
     if result.is_err() {

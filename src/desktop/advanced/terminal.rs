@@ -48,7 +48,13 @@ impl AdvancedUi {
                         format!(
                             "{}{}",
                             terminal.title,
-                            if terminal.alive { "" } else { " [exited]" }
+                            if terminal.closing {
+                                " [closing]"
+                            } else if terminal.alive {
+                                ""
+                            } else {
+                                " [exited]"
+                            }
                         ),
                     )
                     .clicked()
@@ -61,6 +67,13 @@ impl AdvancedUi {
         if self.terminal_id.is_empty() {
             return;
         }
+        if sessions
+            .iter()
+            .any(|s| s.id == self.terminal_id && s.closing)
+        {
+            ui.label("Closing terminal…");
+            return;
+        }
         ui.horizontal(|ui| {
             if ui.button("Interrupt · Ctrl+C").clicked() {
                 let _ = self
@@ -68,15 +81,11 @@ impl AdvancedUi {
                     .key(&self.terminal_id, TerminalKey::Interrupt);
             }
             if ui.button("Close session").clicked() {
-                if let Err(e) = self.terminals.close(&self.terminal_id) {
+                if let Err(e) = self.terminals.request_close(&self.terminal_id) {
                     self.error = Some(e.to_string());
                 }
-                self.terminal_id = self
-                    .terminals
-                    .list()
-                    .first()
-                    .map(|t| t.id.clone())
-                    .unwrap_or_default();
+                self.terminal_sizes.remove(&self.terminal_id);
+                ctx.request_repaint();
             }
             if ui.button("Copy screen").clicked() {
                 if let Ok(screen) = self.terminals.snapshot(&self.terminal_id) {

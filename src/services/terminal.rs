@@ -2,15 +2,19 @@
 //! page changes. Closing a session closes its terminal and reaps its shell.
 //! A terminal is intentionally a real user process, not a filesystem sandbox.
 
+#[path = "terminal/process.rs"]
+mod process;
+use process::TerminalProcess;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_SESSIONS: usize = 12;
@@ -90,6 +94,8 @@ pub struct TerminalSummary {
     pub initial_directory: PathBuf,
     pub pid: u32,
     pub alive: bool,
+    #[serde(default)]
+    pub closing: bool,
     pub exit_code: Option<i32>,
     /// The session runs inside the bubblewrap sandbox.
     #[serde(default)]
@@ -243,13 +249,11 @@ struct TerminalSession {
     id: String,
     title: String,
     initial_directory: PathBuf,
-    pid: u32,
-    child: Mutex<Child>,
+    process: TerminalProcess,
     writer: Mutex<Option<std::fs::File>>,
     state: Arc<Mutex<TerminalState>>,
     stop: Arc<AtomicBool>,
     output_closed: Arc<AtomicBool>,
-    exit_code: Mutex<Option<i32>>,
     sandboxed: bool,
     ai_access: AtomicBool,
 }
@@ -258,34 +262,35 @@ struct TerminalSession {
 struct TerminalRegistry {
     sessions: BTreeMap<String, Arc<TerminalSession>>,
     opening: usize,
+    shutting_down: bool,
 }
 
 /// An opening consumes a slot without holding the registry lock across process
 /// creation. Failed opens release their slot, including errors before `spawn`.
-struct OpenReservation {
-    registry: Arc<Mutex<TerminalRegistry>>,
-}
+struct OpenReservation<'a>(&'a TerminalManager);
 
-impl OpenReservation {
-    fn new(registry: &Arc<Mutex<TerminalRegistry>>) -> Result<Self> {
-        let mut guard = registry
+impl<'a> OpenReservation<'a> {
+    fn new(manager: &'a TerminalManager) -> Result<Self> {
+        let mut registry = manager
+            .registry
             .lock()
             .map_err(|_| anyhow::anyhow!("Terminal registry unavailable"))?;
-        if guard.sessions.len() + guard.opening >= MAX_SESSIONS {
+        if registry.shutting_down {
+            bail!("The terminal manager is shutting down");
+        }
+        if registry.sessions.len() + registry.opening >= MAX_SESSIONS {
             bail!("Close a terminal before opening more than {MAX_SESSIONS} sessions");
         }
-        guard.opening += 1;
-        Ok(Self {
-            registry: registry.clone(),
-        })
+        registry.opening += 1;
+        Ok(Self(manager))
     }
 }
 
-impl Drop for OpenReservation {
+impl Drop for OpenReservation<'_> {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.registry.lock() {
-            guard.opening = guard.opening.saturating_sub(1);
-        }
+        let mut registry = self.0.registry.lock().unwrap_or_else(|e| e.into_inner());
+        registry.opening -= 1;
+        self.0.opens_finished.notify_all();
     }
 }
 
@@ -294,6 +299,7 @@ impl Drop for OpenReservation {
 #[derive(Clone, Default)]
 pub struct TerminalManager {
     registry: Arc<Mutex<TerminalRegistry>>,
+    opens_finished: Arc<Condvar>,
 }
 
 impl TerminalManager {
@@ -306,7 +312,7 @@ impl TerminalManager {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::process::CommandExt;
         config.validate()?;
-        let _reservation = OpenReservation::new(&self.registry)?;
+        let _reservation = OpenReservation::new(self)?;
         let cwd = config
             .cwd
             .canonicalize()
@@ -388,9 +394,8 @@ impl TerminalManager {
                 Ok(())
             });
         }
-        let child = spawn_from_persistent_thread(command)
+        let process = TerminalProcess::spawn(command, &master)
             .with_context(|| format!("Launch terminal executable {}", config.program))?;
-        let pid = child.id();
         let state = Arc::new(Mutex::new(TerminalState {
             parser: vt100::Parser::new_with_callbacks(
                 dimension(config.rows),
@@ -410,13 +415,11 @@ impl TerminalManager {
             id: id.clone(),
             title: config.title,
             initial_directory: cwd,
-            pid,
-            child: Mutex::new(child),
+            process,
             writer: Mutex::new(Some(master)),
             state: state.clone(),
             stop: stop.clone(),
             output_closed: output_closed.clone(),
-            exit_code: Mutex::new(None),
             sandboxed,
             ai_access: AtomicBool::new(config.ai_access),
         });
@@ -738,6 +741,9 @@ impl TerminalManager {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut rest = bytes;
         while !rest.is_empty() {
+            if session.stop.load(Ordering::Acquire) {
+                bail!("Terminal is closing");
+            }
             match file.write(rest) {
                 Ok(0) => bail!("Terminal stopped accepting input"),
                 Ok(n) => rest = &rest[n..],
@@ -881,25 +887,66 @@ impl TerminalManager {
     }
 
     pub fn close(&self, id: &str) -> Result<()> {
-        let session = self
-            .registry
+        let result = self.session(id)?.terminate();
+        self.registry
             .lock()
             .map_err(|_| anyhow::anyhow!("Terminal registry unavailable"))?
             .sessions
-            .remove(id)
-            .context("Unknown terminal session")?;
-        session.terminate();
+            .remove(id);
+        result
+    }
+
+    /// The desktop requests shutdown here and polls for completion on later frames.
+    pub(crate) fn request_close(&self, id: &str) -> Result<()> {
+        self.session(id)?.request_close();
         Ok(())
     }
 
+    pub(crate) fn reap_closed(&self) -> Result<()> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Terminal registry unavailable"))?;
+        let mut result = Ok(());
+        registry.sessions.retain(|_, session| {
+            if session.stop.load(Ordering::Acquire) && session.process.finished() {
+                if let Err(error) = session.process.join() {
+                    result = Err(error).context("Clean up closed terminal");
+                }
+                false
+            } else {
+                true
+            }
+        });
+        result
+    }
+
     pub fn close_all(&self) {
-        let sessions = match self.registry.lock() {
-            Ok(mut registry) => std::mem::take(&mut registry.sessions),
-            Err(_) => return,
+        let sessions = {
+            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut registry.sessions)
         };
         for session in sessions.values() {
-            session.terminate();
+            session.request_close();
         }
+        for session in sessions.values() {
+            if let Err(error) = session.terminate() {
+                eprintln!("Terminal {} cleanup failed: {error:#}", session.id);
+            }
+        }
+    }
+
+    /// Once the desktop exits, even an engine clone may no longer open a PTY.
+    /// Wait for already reserved opens to register (or fail) before draining.
+    pub(crate) fn shutdown(&self) {
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        registry.shutting_down = true;
+        drop(
+            self.opens_finished
+                .wait_while(registry, |r| r.opening != 0)
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        self.close_all();
     }
 
     fn session(&self, id: &str) -> Result<Arc<TerminalSession>> {
@@ -915,123 +962,35 @@ impl TerminalManager {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        self.terminate();
+        let _ = self.terminate();
     }
-}
-
-/// Fork terminal processes from one thread that lives as long as the program.
-/// A sandboxed shell runs under `bwrap --die-with-parent`, which is
-/// PR_SET_PDEATHSIG: Linux kills it when the *thread* that forked it exits, not
-/// the process. Terminals are opened from short-lived workers such as Tokio's
-/// blocking pool, whose idle threads exit after ten seconds, so the shell was
-/// hung up seconds after it started. A persistent spawner keeps the protection
-/// (the sandbox still dies with the app) without tying it to a worker thread.
-#[cfg(unix)]
-fn spawn_from_persistent_thread(command: Command) -> std::io::Result<Child> {
-    type Job = (Command, std::sync::mpsc::Sender<std::io::Result<Child>>);
-    static SPAWNER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> =
-        std::sync::OnceLock::new();
-    let spawner = SPAWNER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("workbench-pty-spawner".into())
-            .spawn(move || {
-                for (mut command, reply) in rx {
-                    let _ = reply.send(command.spawn());
-                }
-            })
-            .ok()
-            .map(|_| tx)
-    });
-    let mut command = command;
-    let Some(spawner) = spawner else {
-        return command.spawn();
-    };
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    if let Err(std::sync::mpsc::SendError((mut command, _))) = spawner.send((command, reply_tx)) {
-        return command.spawn();
-    }
-    reply_rx
-        .recv()
-        .unwrap_or_else(|_| Err(std::io::Error::other("Terminal spawner thread stopped")))
 }
 
 impl TerminalSession {
     fn summary(&self) -> Result<TerminalSummary> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Terminal process unavailable"))?;
-        let status = child.try_wait()?;
-        if let Some(status) = status {
-            *self
-                .exit_code
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Terminal process unavailable"))? =
-                Some(status.code().unwrap_or(-1));
-        }
+        let exit_code = self.process.exit_code.get().copied();
+        let closing = self.stop.load(Ordering::Acquire);
         Ok(TerminalSummary {
             id: self.id.clone(),
             title: self.title.clone(),
             initial_directory: self.initial_directory.clone(),
-            pid: self.pid,
-            alive: status.is_none() && !self.stop.load(Ordering::Relaxed),
-            exit_code: *self
-                .exit_code
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Terminal process unavailable"))?,
+            pid: self.process.pid,
+            alive: exit_code.is_none() && !closing,
+            closing,
+            exit_code,
             sandboxed: self.sandboxed,
             ai_access: self.ai_access.load(Ordering::Relaxed),
         })
     }
-    fn terminate(&self) {
-        if self.stop.swap(true, Ordering::Relaxed) {
-            return;
+    fn request_close(&self) {
+        if !self.stop.swap(true, Ordering::AcqRel) {
+            self.process.request_close();
         }
-        if let Ok(mut writer) = self.writer.lock() {
-            #[cfg(unix)]
-            if let Some(file) = writer.as_ref() {
-                use std::os::fd::AsRawFd;
-                let mut foreground: libc::pid_t = 0;
-                if unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCGPGRP as _, &mut foreground) }
-                    == 0
-                    && foreground > 1
-                    && foreground != self.pid as libc::pid_t
-                {
-                    // Close is destructive by contract. Stop the *currently*
-                    // attached foreground job while this PTY still identifies
-                    // its group, before closing the master or hanging up the
-                    // shell. HUP alone is insufficient for a program that
-                    // ignores it. Do not save this group id for a later kill:
-                    // it could have exited and been reused during a grace wait.
-                    unsafe {
-                        libc::kill(-foreground, libc::SIGKILL);
-                    }
-                }
-            }
-            writer.take();
-        }
-        if let Ok(mut child) = self.child.lock() {
-            // A previously reaped shell PID may have been reused by the OS.
-            // The live PTY foreground group was handled above; never signal a
-            // stale shell group after the child has already exited.
-            if child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(self.pid as i32), libc::SIGHUP);
-            }
-            let deadline = Instant::now() + Duration::from_millis(400);
-            while Instant::now() < deadline {
-                if child.try_wait().ok().flatten().is_some() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            crate::integrations::kill_process_group(&mut child);
-            let _ = child.wait();
-        }
+    }
+
+    fn terminate(&self) -> Result<()> {
+        self.request_close();
+        self.process.join().context("Clean up terminal processes")
     }
 }
 
@@ -1328,7 +1287,16 @@ done
         let manager = TerminalManager::new();
         let id = bash(&manager, dir.path());
         let session = manager.session(&id).unwrap();
-        manager.input(&id, b"sleep 30\r").unwrap();
+        // Wait until the child has executed and installed its signal dispositions.
+        // After Ctrl+C the terminal driver can discard queued input until Bash
+        // reclaims the foreground and renders its next prompt.
+        manager
+            .input(
+                &id,
+                b"PS1=INTERRUPT_'READY> '; sh -c 'printf \"CHILD_READY\\n\"; exec sleep 30'\r",
+            )
+            .unwrap();
+        wait_text(&manager, &id, "CHILD_READY\r\n");
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let mut foreground: libc::pid_t = 0;
@@ -1343,7 +1311,7 @@ done
                 }
             };
             assert_eq!(result, 0);
-            if foreground > 1 && foreground != session.pid as libc::pid_t {
+            if foreground > 1 && foreground != session.process.pid as libc::pid_t {
                 break;
             }
             assert!(
@@ -1353,6 +1321,7 @@ done
             std::thread::sleep(Duration::from_millis(10));
         }
         manager.key(&id, TerminalKey::Interrupt).unwrap();
+        wait_text(&manager, &id, "INTERRUPT_READY> ");
         manager
             .input(&id, b"printf 'AFTER_INTERRUPT\\n'\r")
             .unwrap();
@@ -1398,7 +1367,7 @@ done
                 0
             );
         }
-        assert!(foreground > 1 && foreground != session.pid as libc::pid_t);
+        assert!(foreground > 1 && foreground != session.process.pid as libc::pid_t);
         let heartbeat = dir.path().join("heartbeat");
         let size = || {
             std::fs::metadata(&heartbeat)
@@ -1430,8 +1399,111 @@ done
             !survived,
             "close left the HUP/TERM-ignoring foreground job executing"
         );
-        assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(session.process.exit_code.get().is_some());
         assert!(manager.list().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_background_sleep(
+        manager: &TerminalManager,
+        id: &str,
+        dir: &std::path::Path,
+    ) -> libc::pid_t {
+        manager
+            .input(
+                id,
+                b"trap '' HUP; sleep 30 & echo $! > background.pid; printf 'JOB_READY\\n'\r",
+            )
+            .unwrap();
+        wait_text(manager, id, "JOB_READY\r\n");
+        std::fs::read_to_string(dir.join("background.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_job_stopped(job: libc::pid_t) {
+        // PID 1 may not yet have reaped an orphan. A zombie has stopped running.
+        match std::fs::read_to_string(format!("/proc/{job}/stat")) {
+            Ok(stat) => assert_eq!(stat.rsplit_once(") ").unwrap().1.as_bytes()[0], b'Z'),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_exit_reaps_the_leader_and_stops_its_remaining_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new();
+        let id = bash(&manager, dir.path());
+        let shell = manager.summary(&id).unwrap().pid as libc::pid_t;
+        let job = start_background_sleep(&manager, &id, dir.path());
+        manager.input(&id, b"exit 23\r").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while manager.summary(&id).unwrap().alive {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(manager.summary(&id).unwrap().exit_code, Some(23));
+        assert_job_stopped(job);
+        assert_eq!(
+            unsafe { libc::waitpid(shell, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn shutdown_waits_for_open_reservations_and_seals_shared_managers() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new();
+        let id = bash(&manager, dir.path());
+        let reservation = OpenReservation::new(&manager).unwrap();
+        let closing = manager.clone();
+        let shutdown = std::thread::spawn(move || closing.shutdown());
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !manager.registry.lock().unwrap().shutting_down {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!shutdown.is_finished());
+        assert!(OpenReservation::new(&manager).is_err());
+        drop(reservation);
+        shutdown.join().unwrap();
+        assert!(manager.summary(&id).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closing_one_terminal_stops_its_background_job_and_keeps_other_sessions_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TerminalManager::new();
+        let id = bash(&manager, dir.path());
+        let other = bash(&manager, dir.path());
+        let shell_pid = manager.summary(&id).unwrap().pid as libc::pid_t;
+        let job = start_background_sleep(&manager, &id, dir.path());
+        assert_eq!(unsafe { libc::getsid(job) }, shell_pid);
+        assert_ne!(unsafe { libc::getpgid(job) }, shell_pid);
+        manager.request_close(&id).unwrap();
+        assert!(manager.summary(&id).unwrap().closing);
+        assert!(manager.input(&id, b"\r").is_err());
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while manager.summary(&id).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "Closing terminal is still registered"
+            );
+            manager.reap_closed().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_job_stopped(job);
+        assert!(manager.summary(&other).unwrap().alive);
+        manager.close(&other).unwrap();
     }
 
     #[test]

@@ -811,6 +811,45 @@ fn ai_and_visible_terminal_share_sessions_across_engine_rebuilds_but_not_workspa
     assert!(rebuilt.terminal_manager().summary(&id).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn close_session_button_returns_to_the_frame_while_the_terminal_is_closing() {
+    let (dir, ctx, mut app) = fixture();
+    app.page = Page::Advanced;
+    app.advanced.section = crate::advanced_ui::Section::Terminal;
+    app.session.project = Some(dir.path().display().to_string());
+    let manager = app.advanced.terminal_manager_for(Some(dir.path()));
+    let id = manager
+        .open(crate::terminal::TerminalConfig {
+            cwd: dir.path().to_owned(),
+            program: "/bin/sh".into(),
+            args: vec!["-i".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let size = [1280.0, 900.0];
+    frame(&mut app, &ctx, size, vec![]);
+    let output = frame(&mut app, &ctx, size, vec![]);
+    let button = visible_label(&output, "Close session", size).center();
+    frame(
+        &mut app,
+        &ctx,
+        size,
+        vec![
+            egui::Event::PointerMoved(button),
+            click(button, true),
+            click(button, false),
+        ],
+    );
+    assert!(manager.summary(&id).unwrap().closing);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    while manager.summary(&id).is_ok() {
+        assert!(std::time::Instant::now() < deadline);
+        frame(&mut app, &ctx, size, vec![]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn bash_request_selects_a_workspace_and_exposes_shared_terminal_tools() {
     let (dir, _ctx, mut app) = fixture();

@@ -105,16 +105,19 @@ class LaunchAndInstall(unittest.TestCase):
         path.write_text(content)
         return path
 
-    def test_setup_installs_zstd_before_installing_local_ollama(self):
-        # Exercise setup even on hosts that already have Ollama or run as root.
-        for name in ('bash', 'dirname', 'uname', 'sort', 'head', 'awk'):
+    def isolate_setup(self):
+        # None of these fixtures reaches the package manager, network or real HOME.
+        for name in ('bash', 'dirname', 'uname', 'sort', 'head', 'awk', 'mktemp', 'rm', 'sh'):
             (self.tools / name).symlink_to(shutil.which(name))
-        for name in ('apt-get', 'rustup'):
+        for name in ('apt-get', 'sudo', 'rustup'):
             (self.tools / name).symlink_to(shutil.which('true'))
         (self.tools / 'id').write_text('#!/bin/sh\necho 1000\n')
         (self.tools / 'id').chmod(0o755)
         self.env['PATH'] = str(self.tools)
         self.assertFalse((self.home / '.cargo/env').exists())
+
+    def test_setup_installs_zstd_before_installing_local_ollama(self):
+        self.isolate_setup()
         flags = ('--dry-run', '--no-optional', '--no-install')
         local = self.command('setup.sh', '--ollama', *flags)
         self.assertEqual(local.returncode, 0, local.stderr)
@@ -124,6 +127,43 @@ class LaunchAndInstall(unittest.TestCase):
         remote = self.command('setup.sh', '--no-ollama', *flags)
         self.assertEqual(remote.returncode, 0, remote.stderr)
         self.assertNotIn(install_zstd, remote.stdout)
+
+    def test_setup_propagates_the_installed_doctor_exit_status(self):
+        self.isolate_setup()
+        binary = self.old_binary()
+        binary.write_text('#!/bin/sh\n[ "$1" = --doctor ] || exit 3\nexit 19\n')
+        (self.project / 'install.sh').write_text('#!/bin/sh\nexit 0\n')
+        result = self.command('setup.sh', '--no-optional', '--no-ollama')
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertIn('was installed', result.stderr)
+        self.assertIn('exit 19', result.stderr)
+        self.assertNotIn('==> Done', result.stdout)
+
+    def test_setup_only_executes_a_complete_installer_and_removes_it(self):
+        self.isolate_setup()
+        tmp = self.base / 'downloads'
+        tmp.mkdir()
+        self.env['TMPDIR'] = str(tmp)
+        marker = self.base / 'installer ran'
+        self.env['INSTALLER_MARKER'] = str(marker)
+        curl = self.tools / 'curl'
+        curl.write_text("""#!/bin/sh
+while [ "$1" != -o ]; do shift; done
+printf '%s\\n' 'echo complete > "$INSTALLER_MARKER"' > "$2"
+exit "$TRANSFER_STATUS"
+""")
+        curl.chmod(0o755)
+        flags = ('--ollama', '--no-optional', '--no-install')
+        self.env['TRANSFER_STATUS'] = '18'
+        incomplete = self.command('setup.sh', *flags)
+        self.assertEqual(incomplete.returncode, 18, incomplete.stderr)
+        self.assertFalse(marker.exists())
+        self.assertEqual(list(tmp.iterdir()), [])
+        self.env['TRANSFER_STATUS'] = '0'
+        complete = self.command('setup.sh', *flags)
+        self.assertEqual(complete.returncode, 0, complete.stderr)
+        self.assertEqual(marker.read_text().strip(), 'complete')
+        self.assertEqual(list(tmp.iterdir()), [])
 
     def test_release_build_is_locked_and_does_not_clean_or_install(self):
         old = self.old_binary()

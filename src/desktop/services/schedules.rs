@@ -1,6 +1,51 @@
 //! ServicesUi schedules responsibilities.
 use super::*;
 
+pub(super) struct CronPreview {
+    expression: String,
+    timezone: String,
+    calculated_at: DateTime<Utc>,
+    next: Option<DateTime<Utc>>,
+    label: String,
+}
+
+impl CronPreview {
+    fn current(&self, expression: &str, timezone: &str, now: DateTime<Utc>) -> bool {
+        self.expression == expression
+            && self.timezone == timezone
+            && self.calculated_at <= now
+            && self.next.is_none_or(|next| now < next)
+    }
+
+    fn calculate(expression: &str, timezone: &str, now: DateTime<Utc>) -> Self {
+        let result = scheduler::CronSchedule::parse(expression).and_then(|cron| {
+            if cron.is_reboot() {
+                Ok(None)
+            } else {
+                cron.next_after(now, timezone).map(Some)
+            }
+        });
+        let (next, label) = match result {
+            Ok(Some(next)) => (
+                Some(next),
+                format!("Next: {}", display_time(next, timezone)),
+            ),
+            Ok(None) => (
+                None,
+                "Runs once when the daemon observes a new operating-system boot.".into(),
+            ),
+            Err(error) => (None, error.to_string()),
+        };
+        Self {
+            expression: expression.to_owned(),
+            timezone: timezone.to_owned(),
+            calculated_at: now,
+            next,
+            label,
+        }
+    }
+}
+
 impl ServicesUi {
     pub(super) fn schedules_page(&mut self, ui: &mut egui::Ui, workspace: Option<&Path>) {
         ui.heading("Background scheduler");
@@ -123,12 +168,16 @@ impl ServicesUi {
                     ui.add(egui::TextEdit::singleline(&mut self.timezone).desired_width(220.0));
                 });
                 ui.label(RichText::new("minute hour day-of-month month day-of-week · lists, ranges, steps, names and @daily/@reboot · Example: 0 9 * * MON-FRI").small());
-                if let Ok(cron) = scheduler::CronSchedule::parse(&self.cron) {
-                    if cron.is_reboot() {
-                        ui.label("Runs once when the daemon observes a new operating-system boot.");
-                    } else if let Ok(next) = cron.next_after(Utc::now(), &self.timezone) {
-                        ui.label(format!("Next: {}", display_time(next, &self.timezone)));
-                    }
+                let now = Utc::now();
+                let cached = &mut self.cron_preview;
+                if !cached
+                    .as_ref()
+                    .is_some_and(|preview| preview.current(&self.cron, &self.timezone, now))
+                {
+                    *cached = Some(CronPreview::calculate(&self.cron, &self.timezone, now));
+                }
+                if let Some(preview) = cached {
+                    ui.label(&preview.label);
                 }
             }
             1 => {
@@ -411,5 +460,27 @@ impl ServicesUi {
             tx.send(Event::Overview(Box::new(load_overview(&dir)?)))?;
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cron_preview_expires_on_the_occurrence_or_a_clock_or_form_change() {
+        let now = "2026-11-23T11:30:17Z".parse::<DateTime<Utc>>().unwrap();
+        let preview = CronPreview::calculate("* * * * *", "UTC", now);
+        let next = preview.next.unwrap();
+        assert!(preview.current("* * * * *", "UTC", next - chrono::Duration::seconds(1)));
+        assert!(!preview.current("* * * * *", "UTC", next));
+        assert!(!preview.current("* * * * *", "UTC", now - chrono::Duration::minutes(1)));
+        assert!(!preview.current("@hourly", "UTC", now));
+        assert!(!preview.current("* * * * *", "America/New_York", now));
+        let bad = CronPreview::calculate("invalid", "UTC", now);
+        assert!(bad.current("invalid", "UTC", next));
+        assert!(bad.next.is_none());
+        let reboot = CronPreview::calculate("@reboot", "UTC", now);
+        assert!(reboot.current("@reboot", "UTC", next));
     }
 }

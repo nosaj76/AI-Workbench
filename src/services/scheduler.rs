@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -814,9 +814,9 @@ where
     } else {
         "Background scheduler stopped after an error".into()
     };
-    let _ = write_status(dir, &status);
+    let stopped = write_status(dir, &status).context("Save the final scheduler status");
     notify(SchedulerEvent::Stopped);
-    result
+    result.and(stopped)
 }
 
 pub fn run_claimed<F>(
@@ -1400,33 +1400,10 @@ pub fn systemd_argument(text: &str) -> Result<String> {
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("File needs a parent directory")?;
-    fs::create_dir_all(parent)?;
     if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         bail!("Refusing to replace a symlinked state file");
     }
-    let temp = parent.join(format!(".state-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        if let Ok(file) = std::fs::File::open(parent) {
-            file.sync_all()?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
+    crate::persistence::write_atomic(path, bytes)
 }
 fn truncate(text: &str, max: usize) -> String {
     if text.len() <= max {
@@ -1443,11 +1420,39 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     fn utc(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
             .unwrap()
             .with_timezone(&Utc)
     }
+    #[cfg(unix)]
+    #[test]
+    fn state_writes_keep_symlinks_and_report_post_rename_durability_errors() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("status");
+        let link = dir.path().join("status-link");
+        symlink(&file, &link).unwrap();
+        assert!(atomic_write(&link, b"data").is_err());
+        assert!(!file.exists());
+        atomic_write(&file, b"old").unwrap();
+        assert!(atomic_write(&link, b"replacement").is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"old");
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        // Privileged test runners can open the directory despite its mode.
+        let directory_readable = File::open(dir.path()).is_ok();
+        let result = atomic_write(&file, b"new");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        if directory_readable {
+            result.unwrap();
+        } else {
+            assert!(result.unwrap_err().to_string().contains("was replaced"));
+        }
+        assert_eq!(fs::read(&file).unwrap(), b"new");
+    }
+
     #[test]
     fn cron_lists_steps_names_and_posix_day_semantics() {
         let schedule = CronSchedule::parse("*/15 9-17/2 * JAN,MAR MON-FRI").unwrap();

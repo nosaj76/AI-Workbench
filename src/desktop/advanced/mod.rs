@@ -280,11 +280,16 @@ impl AdvancedUi {
         self.studio.cancel_all();
         self.services.cancel_all();
         for manager in self.terminal_workspaces.values_mut() {
-            manager.close_all();
+            manager.shutdown();
         }
-        self.terminals.close_all();
+        self.terminals.shutdown();
     }
     pub fn poll(&mut self, ctx: &egui::Context) {
+        for manager in self.terminal_workspaces.values() {
+            if let Err(error) = manager.reap_closed() {
+                self.error = Some(format!("{error:#}"));
+            }
+        }
         for _ in 0..512 {
             let Ok(event) = self.agent_receiver.try_recv() else {
                 break;

@@ -42,6 +42,9 @@ zstd = "0.13"
 
 tempfile = "3.14"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["event", "process"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -63,12 +63,19 @@ die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 run() {
     if $dry_run; then printf '    [dry-run] %s\n' "$*"; else "$@"; fi
 }
-# Pipes a downloaded installer into a shell; shown verbatim in dry-run mode.
-run_installer() {
-    local url=$1; shift
-    if $dry_run; then printf '    [dry-run] curl -fsSL %s | sh %s\n' "$url" "$*"; return; fi
-    curl --proto '=https' --tlsv1.2 -fsSL "$url" | sh -s -- "$@"
-}
+# Fetch the complete installer before allowing it to change the system.
+run_installer() (
+    local url=$1 installer
+    shift
+    if $dry_run; then
+        note "[dry-run] Download $url, then run it with sh $*"
+        return
+    fi
+    installer=$(mktemp)
+    trap 'rm -f -- "$installer"' EXIT
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL -o "$installer" "$url" || return "$?"
+    sh "$installer" "$@"
+)
 
 # yes/no question; unattended runs (no terminal) take the default.
 confirm() {
@@ -199,7 +206,11 @@ if $install_app; then
     run ./install.sh "${jobs[@]}"
     if ! $dry_run; then
         step "Readiness report"
-        "$HOME/.local/bin/ollama-workbench" --doctor || true
+        "$HOME/.local/bin/ollama-workbench" --doctor || {
+            doctor_status=$?
+            warn "AI Workbench was installed, but its readiness check failed (exit $doctor_status)."
+            exit "$doctor_status"
+        }
     fi
 fi
 

@@ -541,7 +541,7 @@ fn cached_index(
             let fractional_mtime = f.modified
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .is_some_and(|t| t.subsec_nanos() != 0);
-            if !fractional_mtime && !f.change.is_some_and(|(_, _, ns)| ns != 0) {
+            if !fractional_mtime && f.change.is_none_or(|(_, _, ns)| ns == 0) {
                 if Instant::now() >= deadline {
                     listing.complete = false;
                     break;

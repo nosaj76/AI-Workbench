@@ -2734,6 +2734,7 @@ dependencies = [
  "reqwest",
  "rfd",
  "rusqlite",
+ "rustix 1.1.6",
  "scraper",
  "serde",
  "serde_json",

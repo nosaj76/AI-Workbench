@@ -64,6 +64,7 @@ pub struct ServicesUi {
     workspace: String,
     timing_mode: usize,
     cron: String,
+    cron_preview: Option<schedules::CronPreview>,
     timezone: String,
     interval: u64,
     once: String,
@@ -81,7 +82,7 @@ pub struct ServicesUi {
 impl ServicesUi {
     pub fn new(data_dir: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel();
-        let mut ui=Self{dir:data_dir,tab:Tab::Schedules,tx,rx,busy:false,cancel:Arc::new(AtomicBool::new(false)),status:"Loading local services".into(),error:None,jobs:vec![],runs:vec![],daemon:None,runtime:None,release:None,progress:None,last_refresh:Instant::now(),edit_id:None,name:"Project review".into(),prompt:"Review the selected workspace for concrete defects. Cite the files and lines actually inspected, identify incomplete coverage, and report findings without changing files.".into(),model:String::new(),workspace:String::new(),timing_mode:0,cron:"0 9 * * *".into(),timezone:system_timezone(),interval:60,once:(Utc::now()+chrono::Duration::hours(1)).to_rfc3339(),enabled:true,timeout:1800,version:String::new(),port:11434,models:String::new(),logs:String::new(),show_unit:false,endpoint_request:None,session_request:None};
+        let mut ui=Self{dir:data_dir,tab:Tab::Schedules,tx,rx,busy:false,cancel:Arc::new(AtomicBool::new(false)),status:"Loading local services".into(),error:None,jobs:vec![],runs:vec![],daemon:None,runtime:None,release:None,progress:None,last_refresh:Instant::now(),edit_id:None,name:"Project review".into(),prompt:"Review the selected workspace for concrete defects. Cite the files and lines actually inspected, identify incomplete coverage, and report findings without changing files.".into(),model:String::new(),workspace:String::new(),timing_mode:0,cron:"0 9 * * *".into(),cron_preview:None,timezone:system_timezone(),interval:60,once:(Utc::now()+chrono::Duration::hours(1)).to_rfc3339(),enabled:true,timeout:1800,version:String::new(),port:11434,models:String::new(),logs:String::new(),show_unit:false,endpoint_request:None,session_request:None};
         ui.refresh();
         ui
     }
