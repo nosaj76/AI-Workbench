@@ -630,6 +630,15 @@ impl NoteStore {
     /// Brings the search index in line with the files, including notes that
     /// were edited, added or removed outside Workbench.
     pub fn sync(&self) -> Result<usize> {
+        let _lock = self.write_lock()?;
+        self.sync_locked()
+    }
+
+    fn write_lock(&self) -> Result<fs::File> {
+        crate::persistence::lock_file(&self.dir.with_file_name("knowledge-notes.lock"))
+    }
+
+    fn sync_locked(&self) -> Result<usize> {
         let files = self.files();
         let known: Vec<(String, i64)> = {
             let mut statement = self.conn.prepare("SELECT slug, mtime FROM notes")?;
@@ -755,6 +764,7 @@ impl NoteStore {
         if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
             bail!("A topic title must be 1 to {MAX_TITLE_CHARS} characters");
         }
+        let _lock = self.write_lock()?;
         let existing = self.find_topic(&title)?;
         let slug_name = match &existing {
             Some(s) => s.clone(),
@@ -889,17 +899,35 @@ impl NoteStore {
             .flat_map(|entry| entry.sources.iter().cloned())
             .collect();
         note.sources.retain(|source| cited.contains(&source.id));
-        self.save(&note)?;
+        self.save_locked(&note)?;
         Ok(out)
     }
 
     /// Writes a note file (replacing it atomically) and updates the index.
     pub fn save(&self, note: &Note) -> Result<()> {
+        let _lock = self.write_lock()?;
+        self.save_locked(note)
+    }
+
+    fn save_locked(&self, note: &Note) -> Result<()> {
         let path = self.path(&note.slug);
-        let temp = path.with_extension("md.tmp");
-        fs::write(&temp, render_markdown(note))?;
-        fs::rename(&temp, &path)?;
+        crate::persistence::write_atomic(&path, render_markdown(note).as_bytes())?;
         self.reindex(note, Self::mtime(&path))?;
+        self.write_index()
+    }
+
+    /// Commit raw editor text only if the version the user opened still exists.
+    pub(crate) fn save_edit(&self, slug: &str, original: &str, edited: &str) -> Result<()> {
+        if Path::new(slug).file_name() != Some(std::ffi::OsStr::new(slug)) || slug == "INDEX" {
+            bail!("Invalid note name");
+        }
+        let _lock = self.write_lock()?;
+        let path = self.path(slug);
+        if fs::read_to_string(&path).context("Read the current note before saving")? != original {
+            bail!("This note changed after you opened it. Your draft is still in the editor. Copy your edits and reopen the current note before merging them.");
+        }
+        crate::persistence::write_atomic(&path, edited.as_bytes())?;
+        self.reindex(&parse_markdown(edited, slug), Self::mtime(&path))?;
         self.write_index()
     }
 
@@ -912,6 +940,7 @@ impl NoteStore {
         results: &[(String, Consensus)],
         review_line: &str,
     ) -> Result<usize> {
+        let _lock = self.write_lock()?;
         let Some(mut note) = self.get(slug)? else {
             return Ok(0);
         };
@@ -924,7 +953,7 @@ impl NoteStore {
         }
         if updated > 0 {
             note.reviews.push(review_line.to_string());
-            self.save(&note)?;
+            self.save_locked(&note)?;
         }
         Ok(updated)
     }
@@ -1076,6 +1105,7 @@ impl NoteStore {
 
     /// Moves a note to `.deleted/` so it can still be recovered by hand.
     pub fn delete(&self, slug: &str) -> Result<bool> {
+        let _lock = self.write_lock()?;
         let path = self.path(slug);
         if !path.is_file() {
             return Ok(false);
@@ -1084,7 +1114,7 @@ impl NoteStore {
         fs::create_dir_all(&trash)?;
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
         fs::rename(&path, trash.join(format!("{slug}-{stamp}.md")))?;
-        self.sync()?;
+        self.sync_locked()?;
         Ok(true)
     }
 

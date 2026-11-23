@@ -260,9 +260,12 @@ impl Workbench {
         };
         let store = Store::open(&dir)?;
         let summaries = store.list("", false)?;
-        let session = settings
-            .last_session
+        // Older installations stored this pointer in settings.json.
+        let last_session: Option<String> =
+            crate::persistence::read_json(&dir.join("last-session.json"), 1024).ok();
+        let session = last_session
             .as_deref()
+            .or(settings.last_session.as_deref())
             .and_then(|id| store.load(id).ok())
             .or_else(|| summaries.first().and_then(|s| store.load(&s.id).ok()))
             .unwrap_or_default();

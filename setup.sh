@@ -175,6 +175,8 @@ else
         confirm "Install Ollama with its official installer (uses sudo)?" y && ollama=yes || ollama=no
     fi
     if [[ $ollama == yes ]]; then
+        # Current official Linux archives use zstd, including minimal installs.
+        pm_install zstd
         run_installer https://ollama.com/install.sh
     else
         note "Skipped. Install it later from https://ollama.com/download"

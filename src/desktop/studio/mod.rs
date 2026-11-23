@@ -435,6 +435,27 @@ fn save_config(directory: &Path, config: &StudioConfig) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn switching_image_engines_only_prepares_supported_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut studio = StudioUi::new(dir.path().into());
+        studio.workflow_json = r#"{"save":{"class_type":"SaveImage","inputs":{}}}"#.into();
+        studio.extra_args_json = "unfinished input from sd-cli".into();
+        let StudioJob::Image(comfy) = studio.image_job(None).unwrap() else { panic!() };
+        assert!(comfy.1.workflow.is_some());
+
+        studio.config.image.backend = ImageBackend::Automatic1111;
+        let StudioJob::Image(automatic) = studio.image_job(None).unwrap() else { panic!() };
+        assert!(automatic.1.workflow.is_none());
+
+        studio.config.image.backend = ImageBackend::StableDiffusionCpp;
+        studio.extra_args_json = r#"["--verbose"]"#.into();
+        studio.image_input = "a previous image.png".into();
+        let StudioJob::Image(cli) = studio.image_job(None).unwrap() else { panic!() };
+        assert!(cli.1.workflow.is_none() && cli.1.input_image.is_none());
+        assert_eq!(cli.0.sd_extra_args, ["--verbose"]);
+    }
+
+    #[test]
     fn studio_settings_roundtrip_and_invalid_original_is_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let config = StudioConfig {

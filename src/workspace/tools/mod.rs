@@ -111,6 +111,13 @@ pub enum PreparedTool {
     Approval(Box<PendingAction>),
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GitCommitSnapshot {
+    head: String,
+    head_ref: String,
+    tree: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Operation {
@@ -142,6 +149,8 @@ pub enum Operation {
         message: String,
         paths: Vec<String>,
         branch: Option<String>,
+        #[serde(default)]
+        snapshot: GitCommitSnapshot,
     },
     Command {
         spec: CommandSpec,
@@ -2738,6 +2747,61 @@ for line in sys.stdin:
         assert!(result["provider_text"].is_null());
         // An invalid option is refused before anything is sent.
         assert!(e.prepare("web_search", &json!({"query":"rust","safe_search":"maximum"})).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approved_mapped_search_sends_the_previewed_filters_and_image_parameters() {
+        let script = r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': name, 'inputSchema': {'type': 'object'}} for name in ['fixture_web_search', 'fixture_images']]}
+    elif method == 'tools/call':
+        result = {'content': [{'type': 'text', 'text': json.dumps(request['params'])}]}
+    print(json.dumps({'jsonrpc':'2.0', 'id':request['id'], 'result':result}), flush=True)
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), backups.path());
+        e.set_network_enabled(true);
+        let mut config = mapped_search_server(script);
+        let mapping = config.web_search.as_mut().unwrap();
+        mapping.time_range_argument = Some("freshness".into());
+        mapping.time_range_values.insert("week".into(), json!("pw"));
+        mapping.image_search = Some(crate::mcp::McpImageSearchConfig {
+            tool: Some("fixture_images".into()),
+            extra_arguments: BTreeMap::from([("workflow".into(), json!("images"))]),
+        });
+        e.register_mcp(config).unwrap();
+        for mode in ["general", "images"] {
+            if mode == "images" {
+                e.set_local_sites_url(Some("http://127.0.0.1:9".into()))
+                    .unwrap();
+            }
+            let action = approval(
+                e.prepare(
+                    "web_search",
+                    &json!({"query": "orchard", "mode": mode, "time_range": "week", "limit": 2}),
+                )
+                .unwrap(),
+            );
+            assert_eq!(action.details["arguments"]["freshness"], "pw");
+            if mode == "images" {
+                assert_eq!(action.details["tool"], "fixture_images");
+                assert_eq!(action.details["arguments"]["workflow"], "images");
+            }
+            let result = e.approve(&action).unwrap();
+            let received: Value =
+                serde_json::from_str(result["provider_text"].as_str().unwrap()).unwrap();
+            assert_eq!(received["name"], action.details["tool"]);
+            assert_eq!(received["arguments"], action.details["arguments"]);
+        }
     }
 
     #[test]

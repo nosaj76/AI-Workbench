@@ -19,7 +19,9 @@ impl Workbench {
         if self.busy || self.work_busy || self.approval.is_some() {
             return;
         }
-        self.persist();
+        if !self.persist() {
+            return;
+        }
         // A new conversation starts without a project; connect one explicitly.
         self.session = Session::default();
         self.clear_workspace_view();
@@ -38,7 +40,9 @@ impl Workbench {
         if self.busy || self.work_busy || self.approval.is_some() {
             return;
         }
-        self.persist();
+        if !self.persist() {
+            return;
+        }
         match self.store.load(id) {
             Ok(session) => {
                 if session.deleted_at.is_some() {
@@ -72,14 +76,17 @@ impl Workbench {
         }
     }
 
-    pub(super) fn persist(&mut self) {
+    /// A caller replacing this session must keep it in memory if saving fails.
+    pub(super) fn persist(&mut self) -> bool {
         if self.demo {
-            return;
+            return true;
         }
         if let Err(e) = self.store.save(&mut self.session) {
             if !e.is::<storage::SessionConflict>() {
                 self.error = Some(format!("Save conversation: {e:#}"));
-                return;
+                self.dirty = true;
+                self.last_save = Instant::now();
+                return false;
             }
             let mut copy = self.session.clone();
             copy.id = uuid::Uuid::new_v4().to_string();
@@ -88,20 +95,23 @@ impl Workbench {
             }
             if let Err(error) = self.store.save(&mut copy) {
                 self.error = Some(format!("Save recovered conversation: {error:#}"));
-                return;
+                self.dirty = true;
+                self.last_save = Instant::now();
+                return false;
             }
             self.session = copy;
             self.error = Some("Another window changed this conversation. Your edits were saved in a separate conversation.".into());
         }
         self.settings.last_session = Some(self.session.id.clone());
-        if !self.settings_corrupt {
-            if let Err(e) = self.settings.save(&self.dir) {
-                self.error = Some(format!("Save settings: {e:#}"));
-            }
+        if let Err(e) =
+            crate::persistence::write_json(&self.dir.join("last-session.json"), &self.session.id)
+        {
+            self.error = Some(format!("Save last-opened conversation: {e:#}"));
         }
         self.refresh_conversation_list();
         self.dirty = false;
         self.last_save = Instant::now();
+        true
     }
 
     pub(super) fn refresh_conversation_list(&mut self) {
@@ -139,8 +149,8 @@ impl Workbench {
     }
 
     fn toggle_conversation_flag(&mut self, id: &str, pin: bool) {
-        if id == self.session.id {
-            self.persist();
+        if id == self.session.id && !self.persist() {
+            return;
         }
         match self.store.load(id) {
             Ok(mut session) => {
@@ -171,8 +181,8 @@ impl Workbench {
         if self.busy || self.work_busy || self.approval.is_some() {
             return;
         }
-        if id == self.session.id {
-            self.persist();
+        if id == self.session.id && !self.persist() {
+            return;
         }
         match self.store.move_to_trash(id) {
             Ok(()) => {

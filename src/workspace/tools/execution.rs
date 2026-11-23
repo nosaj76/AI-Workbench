@@ -164,7 +164,8 @@ impl ToolEngine {
                 message,
                 paths,
                 branch,
-            } => self.execute_git_commit(message, paths, branch.as_deref()),
+                snapshot,
+            } => self.execute_git_commit(message, paths, branch.as_deref(), snapshot),
             Operation::MakeDirectory { path } => {
                 let target = self.workspace.resolve(path, true)?;
                 self.create_dir_confined(&target)?;
@@ -207,7 +208,7 @@ impl ToolEngine {
                     .map_err(|_| anyhow::anyhow!("Search lock failed"))?
                     .as_ref()
                     != Some(base_url)
-                    || self.local_sites_url()? != *local_sites
+                    || (!*images && self.local_sites_url()? != *local_sites)
                 {
                     bail!("Search configuration changed; request a new preview");
                 }
@@ -530,7 +531,7 @@ impl ToolEngine {
                 let config = self.mcp_config(server_id)?;
                 if !config.enabled
                     || hash(&serde_json::to_vec(&config)?) != *config_hash
-                    || self.local_sites_url()? != *local_sites
+                    || (!*images && self.local_sites_url()? != *local_sites)
                 {
                     bail!("MCP search configuration changed or is disabled; request a new preview");
                 }
@@ -538,9 +539,9 @@ impl ToolEngine {
                     .web_search
                     .as_ref()
                     .context("MCP server is no longer configured for web search")?;
-                if mapping.tool.as_str() != tool_name.as_str()
-                    || mapping.arguments(query, *limit)? != *arguments
-                {
+                let (current_tool, current_arguments, _) =
+                    mapping.request(query, *limit, options, *images)?;
+                if current_tool != *tool_name || current_arguments != *arguments {
                     bail!("MCP web-search mapping changed; request a new preview");
                 }
                 let client = self.connected_or_start_mcp(&config, cancel.clone())?;

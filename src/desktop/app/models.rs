@@ -26,16 +26,18 @@ impl Workbench {
         ui.separator();
         egui::ScrollArea::vertical().id_salt("models_page").show(ui,|ui|{
             let mut action=None;
+            let mut model_changed = false;
             egui::Grid::new("models_table").num_columns(5).striped(true).spacing([16.0,12.0]).show(ui,|ui|{
                 ui.strong("Model");ui.strong("Size");ui.strong("Format / family");ui.strong("Use");ui.strong("Manage");ui.end_row();
                 for model in &self.models{
                     ui.label(RichText::new(&model.name).monospace());ui.label(format!("{:.2} GB",model.size as f64/1e9));let family=model.details.get("family").and_then(Value::as_str).unwrap_or("");let quant=model.details.get("quantization_level").and_then(Value::as_str).unwrap_or("");ui.label(format!("{family} {quant}"));
-                    if ui.button(if self.settings.model==model.name{"Selected"}else{"Use"}).clicked(){self.settings.model=model.name.clone();}
+                    if ui.button(if self.settings.model==model.name{"Selected"}else{"Use"}).clicked(){self.settings.model=model.name.clone();model_changed = true;}
                     ui.horizontal(|ui|{if ui.add_enabled(!self.work_busy,egui::Button::new("Info").small()).clicked(){action=Some(("show".to_string(),model.name.clone()));}
 if ui.add_enabled(!self.work_busy,egui::Button::new("Unload").small()).clicked(){action=Some(("unload".to_string(),model.name.clone()));}
 if ui.add_enabled(!self.work_busy,egui::Button::new("Delete").small()).clicked(){self.model_delete=Some(model.name.clone());}});ui.end_row();
                 }
             });
+            if model_changed { self.save_preferences(); }
             if let Some((kind,name))=action{self.model_action(&kind,&name);}
             if self.models.is_empty(){ui.label("No installed models were returned. Check that Ollama is running, then refresh.");}
             ui.add_space(16.0);ui.separator();

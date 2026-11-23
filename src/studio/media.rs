@@ -28,6 +28,7 @@ pub struct MediaTools {
     pub ffmpeg: String,
     pub ffprobe: String,
     pub pdftoppm: String,
+    pub pdfinfo: String,
     pub tesseract: String,
     pub whisper: String,
     pub whisper_model: PathBuf,
@@ -46,6 +47,7 @@ impl Default for MediaTools {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             pdftoppm: "pdftoppm".into(),
+            pdfinfo: "pdfinfo".into(),
             tesseract: "tesseract".into(),
             whisper: "whisper-cli".into(),
             whisper_model: PathBuf::new(),
@@ -172,7 +174,7 @@ pub fn preview(tools: &MediaTools, request: &MediaRequest) -> Result<Value> {
                 bail!("Choose 1–100 PDF pages and a resolution of 50–300 DPI");
             }
             language_name(language)?;
-            vec![tools.pdftoppm.clone(), tools.tesseract.clone()]
+            vec![tools.pdfinfo.clone(), tools.pdftoppm.clone(), tools.tesseract.clone()]
         }
         MediaRequest::ImageOcr { input, language } => {
             regular_input(input, MAX_IMAGE_BYTES)?;
@@ -291,56 +293,58 @@ pub fn run(
             } => {
                 let input = regular_input(input, 128 * 1024 * 1024)?;
                 progress(format!("Rendering PDF pages {first_page}–{last_page}"));
-                execute(
-                    tools,
-                    &dir,
-                    &cancel,
-                    &mut commands,
-                    &tools.pdftoppm,
+                let info = execute(
+                    tools, &dir, &cancel, &mut commands, &tools.pdfinfo,
                     vec![
-                        "-png".into(),
-                        "-r".into(),
-                        dpi.to_string(),
-                        "-scale-to".into(),
-                        "2000".into(),
-                        "-f".into(),
-                        first_page.to_string(),
-                        "-l".into(),
-                        last_page.to_string(),
-                        path_text(&input)?,
-                        path_text(&dir.join("page"))?,
+                        "-f".into(), first_page.to_string(),
+                        "-l".into(), last_page.to_string(),
+                        "-box".into(), path_text(&input)?,
                     ],
                     None,
                 )?;
-                let mut pages = Vec::<(u32, PathBuf)>::new();
-                for entry in fs::read_dir(&dir)? {
-                    let entry = entry?;
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if let Some(number) = name
-                        .strip_prefix("page-")
-                        .and_then(|s| s.strip_suffix(".png"))
-                        .and_then(|s| s.parse::<u32>().ok())
-                    {
-                        if number >= *first_page && number <= *last_page {
-                            pages.push((number, entry.path()));
-                        }
-                    }
-                }
-                pages.sort_by_key(|p| p.0);
-                if pages.is_empty() {
-                    bail!("The PDF renderer did not produce any requested pages");
-                }
-                if pages.len() > 100 {
-                    bail!("PDF renderer exceeded the page limit");
-                }
+                let mut pages = Vec::new();
                 let mut total_bytes = 0;
-                for (number, image) in &pages {
-                    check_cancel(&cancel)?;
-                    image_input(image)?;
-                    total_bytes += fs::metadata(image)?.len();
+                for line in info.stdout.lines() {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    let ["Page", page, "MediaBox:", left, bottom, right, top] = fields.as_slice() else {
+                        continue;
+                    };
+                    let number: u32 = page.parse()?;
+                    if number < *first_page || number > *last_page || pages.len() >= 100 {
+                        bail!("The PDF inspector returned an unexpected page number: {number}");
+                    }
+                    let width = right.parse::<f64>()? - left.parse::<f64>()?;
+                    let height = top.parse::<f64>()? - bottom.parse::<f64>()?;
+                    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                        bail!("The PDF inspector reported invalid dimensions for page {number}");
+                    }
+                    // Poppler's -scale-to overrides -r. Calculate the requested
+                    // raster size per page, then cap the longest side before rendering.
+                    let longest_side = width.max(height) * f64::from(*dpi) / 72.0;
+                    let pixels = longest_side.ceil().clamp(1.0, 2000.0) as u32;
+                    let prefix = dir.join(format!("page-{number}"));
+                    execute(
+                        tools, &dir, &cancel, &mut commands, &tools.pdftoppm,
+                        vec![
+                            "-png".into(), "-singlefile".into(), "-scale-to".into(), pixels.to_string(),
+                            "-f".into(), number.to_string(), "-l".into(), number.to_string(),
+                            path_text(&input)?, path_text(&prefix)?,
+                        ],
+                        None,
+                    )?;
+                    let image = prefix.with_extension("png");
+                    total_bytes += fs::metadata(&image)?.len();
                     if total_bytes > 512 * 1024 * 1024 {
                         bail!("Rendered PDF pages exceed 512 MiB");
                     }
+                    pages.push((number, image));
+                }
+                if pages.is_empty() {
+                    bail!("The PDF renderer did not produce any requested pages");
+                }
+                for (number, image) in &pages {
+                    check_cancel(&cancel)?;
+                    image_input(image)?;
                     progress(format!("Recognizing PDF page {number}"));
                     let text = ocr(tools, &dir, image, language, &cancel, &mut commands)?;
                     output.text.push_str(&format!(
@@ -525,6 +529,11 @@ pub fn run(
                         ],
                         None,
                     )?;
+                    // FFmpeg exits successfully without writing a file when the
+                    // selected video stream ends before the audio/container.
+                    if !path.try_exists()? {
+                        break;
+                    }
                     image_input(&path)?;
                     frames.push(json!({"path":path,"requested_timestamp_seconds":time}));
                     output.files.push(path);
@@ -1356,12 +1365,15 @@ printf '{"transcription":[{"text":"Recorded project decisions."}]}' > "${prefix}
         image::RgbImage::from_pixel(4, 4, image::Rgb([255, 255, 255]))
             .save(&image)
             .unwrap();
+        let inspector = fixture_executable(temp.path(), "pdf-inspector",
+            "printf 'Page 2 MediaBox: 0 0 612 792\\nPage 3 MediaBox: 0 0 1500 1800\\n'");
         let renderer = fixture_executable(temp.path(), "pdf-renderer", &format!(
-            "for argument do prefix=$argument; done\ncp {} \"${{prefix}}-02.png\"\ncp {} \"${{prefix}}-03.png\"", quoted_fixture(&image), quoted_fixture(&image)));
+            "for argument do prefix=$argument; done\ncp {} \"${{prefix}}.png\"", quoted_fixture(&image)));
         let ocr = fixture_executable(temp.path(), "ocr", "printf 'Recognized page text.\\n'");
         let output = run(
             &MediaTools {
                 pdftoppm: renderer,
+                pdfinfo: inspector,
                 tesseract: ocr,
                 ..Default::default()
             },
@@ -1377,6 +1389,9 @@ printf '{"transcription":[{"text":"Recorded project decisions."}]}' > "${prefix}
             |_| {},
         )
         .unwrap();
+        let log: Value = serde_json::from_slice(&fs::read(output.directory.join("commands.json")).unwrap()).unwrap();
+        assert_eq!(log[1]["command"]["args"][3], "1650"); // Letter at 150 DPI
+        assert_eq!(log[2]["command"]["args"][3], "2000"); // Poster hits the cap
         assert!(output.text.contains("page 2"));
         assert!(output.text.contains("page 3"));
         assert!(!output.text.contains("page 4"));
@@ -1433,6 +1448,28 @@ printf '{"transcription":[{"text":"Recorded project decisions."}]}' > "${prefix}
         assert!(output
             .text
             .contains("Samples do not constitute a complete video review"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_manifest_keeps_valid_frames_when_audio_outlasts_video() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("clip.mkv");
+        fs::write(&input, b"video fixture").unwrap();
+        let image = temp.path().join("fixture.png");
+        image::RgbImage::new(2, 2).save(&image).unwrap();
+        let tools = MediaTools {
+            ffprobe: fixture_executable(temp.path(), "probe", r#"printf '{"format":{"duration":"4.0"}}'"#),
+            ffmpeg: fixture_executable(temp.path(), "extract", &format!(
+                "for argument do path=$argument; done\ncase \"$path\" in *frame-0001.png) cp {} \"$path\";; esac",
+                quoted_fixture(&image))),
+            ..Default::default()
+        };
+        let result = run(&tools, &MediaRequest::VideoFrames {input, every_seconds: 1.0, max_frames: 4},
+            temp.path(), Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(result.directory.join("frames.json")).unwrap()).unwrap();
+        assert_eq!(manifest["frames"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["frames"][0]["requested_timestamp_seconds"], 0.0);
     }
 
     #[cfg(unix)]

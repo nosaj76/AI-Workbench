@@ -16,6 +16,9 @@ pub struct Entry {
     pub sources: Vec<String>,
     #[serde(default)]
     pub model: String,
+    /// Comparison results stay in the transcript but do not set the next chat model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub comparison_candidate: bool,
     #[serde(default)]
     pub stats: serde_json::Value,
     #[serde(default)]
@@ -30,6 +33,7 @@ impl Entry {
             display: None,
             sources: vec![],
             model: String::new(),
+            comparison_candidate: false,
             stats: serde_json::Value::Null,
             context: String::new(),
         }
@@ -219,6 +223,10 @@ impl Store {
         }
         migration.commit()?;
         conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_sessions_trash ON sessions(deleted_at, archived, pinned, updated_at);")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_recent ON sessions(updated_at DESC, id DESC)
+             WHERE deleted_at IS NULL",
+        )?;
         crate::conversation_diagnostics::initialize(&conn)?;
         Ok(Self {
             conn,
@@ -348,6 +356,19 @@ impl Store {
         Ok(session)
     }
 
+    pub(crate) fn recent_answered(&self, count: usize) -> Result<Vec<Session>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id FROM sessions
+             WHERE deleted_at IS NULL AND EXISTS (
+                 SELECT 1 FROM json_each(sessions.data, '$.entries') AS entry
+                 WHERE json_extract(entry.value, '$.message.role') = 'assistant'
+             )
+             ORDER BY updated_at DESC, id DESC LIMIT ?1",
+        )?;
+        let ids = statement.query_map([i64::try_from(count)?], |row| row.get::<_, String>(0))?;
+        ids.map(|id| self.load(&id?)).collect()
+    }
+
     pub fn list(&self, query: &str, include_archived: bool) -> Result<Vec<SessionSummary>> {
         self.list_filtered(query, include_archived, false)
     }
@@ -448,9 +469,35 @@ impl Store {
     }
 }
 
-pub fn export_json(session: &Session, path: &Path) -> Result<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(session)?)?;
+// A chat may contain several 32 MiB batches of base64-encoded images.
+const MAX_CONVERSATION_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CONVERSATION_ENTRIES: usize = 100_000;
+
+fn validate_exchange(session: &Session) -> Result<()> {
+    if session.entries.len() > MAX_CONVERSATION_ENTRIES {
+        bail!("Conversation exceeds {MAX_CONVERSATION_ENTRIES} messages");
+    }
+    for entry in &session.entries {
+        if !matches!(entry.message.role.as_str(), "user" | "assistant" | "tool" | "system") {
+            bail!("Unknown message role in conversation");
+        }
+    }
     Ok(())
+}
+
+pub fn export_json(session: &Session, path: &Path) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    validate_exchange(session)?;
+    crate::persistence::write_atomic_with(path, |file| {
+        let mut writer = BufWriter::new(&mut *file);
+        serde_json::to_writer(&mut writer, session)?;
+        writer.flush()?;
+        drop(writer);
+        if file.metadata()?.len() > MAX_CONVERSATION_BYTES {
+            bail!("Conversation JSON exceeds the 256 MiB exchange limit");
+        }
+        Ok(())
+    })
 }
 
 pub fn export_markdown(session: &Session, path: &Path) -> Result<()> {
@@ -494,22 +541,18 @@ pub fn export_markdown(session: &Session, path: &Path) -> Result<()> {
 }
 
 pub fn import_json(path: &Path) -> Result<Session> {
-    if std::fs::metadata(path)?.len() > 64 * 1024 * 1024 {
-        bail!("Conversation import exceeds 64 MiB");
+    use std::io::{BufReader, Read};
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_CONVERSATION_BYTES {
+        bail!("Conversation JSON exceeds the 256 MiB exchange limit");
     }
-    let mut session: Session = serde_json::from_slice(&std::fs::read(path)?)
+    let mut input = BufReader::new(file).take(MAX_CONVERSATION_BYTES + 1);
+    let mut session: Session = serde_json::from_reader(&mut input)
         .context("This file is not a Workbench conversation export")?;
-    if session.entries.len() > 20_000 {
-        bail!("Conversation has too many messages");
+    if input.limit() == 0 {
+        bail!("Conversation JSON exceeds the 256 MiB exchange limit");
     }
-    for entry in &session.entries {
-        if !matches!(
-            entry.message.role.as_str(),
-            "user" | "assistant" | "tool" | "system"
-        ) {
-            bail!("Unknown message role in import");
-        }
-    }
+    validate_exchange(&session)?;
     session.id = uuid::Uuid::new_v4().to_string();
     session.title = format!("{} (imported)", session.title);
     session.project = None;
@@ -522,6 +565,49 @@ pub fn import_json(path: &Path) -> Result<Session> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn self_review_uses_recency_across_pins_and_the_sidebar_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let transaction = store.conn.unchecked_transaction().unwrap();
+        let answered = vec![Entry::new(ChatMessage {
+            role: "assistant".into(),
+            content: "An answer".into(),
+            ..Default::default()
+        })];
+        for index in 0..500 {
+            let old = Session {
+                id: format!("old-{index:03}"),
+                updated_at: "2024-01-01T00:00:00Z".into(),
+                pinned: true,
+                entries: answered.clone(),
+                ..Default::default()
+            };
+            store.write_session(&old, None).unwrap();
+        }
+        let newest = Session {
+            id: "newest-answered".into(),
+            updated_at: "2025-01-01T00:00:00Z".into(),
+            archived: true,
+            entries: answered,
+            ..Default::default()
+        };
+        store.write_session(&newest, None).unwrap();
+        let trashed = Session {
+            id: "trashed".into(),
+            deleted_at: Some("2026-01-01T00:00:00Z".into()),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            ..newest.clone()
+        };
+        store.write_session(&trashed, None).unwrap();
+        store.write_session(&Session::default(), None).unwrap();
+        transaction.commit().unwrap();
+        let selected = crate::self_review::recent_sessions(&store, 1).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, newest.id);
+        assert!(crate::self_review::recent_sessions(&store, 0).unwrap().is_empty());
+    }
+
     #[test]
     fn a_long_draft_written_next_to_a_tool_call_is_shortened_when_replayed() {
         let mut draft = Entry::new(ChatMessage {
@@ -706,6 +792,28 @@ mod trash_tests {
         assert_eq!(store.list_trash("").unwrap().len(), 1);
         session = store.load(&session.id).unwrap();
         assert!(session.deleted_at.is_some());
+    }
+
+    #[test]
+    fn large_image_conversation_roundtrips_through_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.json");
+        let mut session = Session::default();
+        // Three normal image turns, each carrying 16 MiB of image data as base64.
+        for _ in 0..3 {
+            session.entries.push(Entry::new(ChatMessage {
+                role: "user".into(),
+                images: vec!["A".repeat((16_usize * 1024 * 1024).div_ceil(3) * 4)],
+                ..Default::default()
+            }));
+        }
+        export_json(&session, &path).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+        let restored = import_json(&path).unwrap();
+        assert_eq!(restored.entries.len(), session.entries.len());
+        for (original, imported) in session.entries.iter().zip(&restored.entries) {
+            assert_eq!(original.message.images, imported.message.images);
+        }
     }
 
     #[test]

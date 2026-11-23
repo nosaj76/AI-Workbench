@@ -185,6 +185,7 @@ impl ServicesUi {
         ui.heading("Saved jobs");
         let mut edit = None;
         let mut change = None;
+        let mut queue = None;
         let mut remove = None;
         for job in &self.jobs {
             ui.group(|ui| {
@@ -221,10 +222,7 @@ impl ServicesUi {
                         .add_enabled(!self.busy, egui::Button::new("Queue now").small())
                         .clicked()
                     {
-                        let mut changed = job.clone();
-                        changed.enabled = true;
-                        changed.next_run = Utc::now();
-                        change = Some(changed);
+                        queue = Some(job.id.clone());
                     }
                     if ui
                         .add_enabled(!self.busy, egui::Button::new("Remove schedule").small())
@@ -267,6 +265,14 @@ impl ServicesUi {
             let dir = self.dir.clone();
             self.work("Updating scheduled job", move |tx, _| {
                 SchedulerStore::open(&dir)?.upsert(&job)?;
+                tx.send(Event::Overview(Box::new(load_overview(&dir)?)))?;
+                Ok(())
+            });
+        }
+        if let Some(id) = queue {
+            let dir = self.dir.clone();
+            self.work("Queuing scheduled job", move |tx, _| {
+                SchedulerStore::open(&dir)?.queue_now(&id, Utc::now())?;
                 tx.send(Event::Overview(Box::new(load_overview(&dir)?)))?;
                 Ok(())
             });

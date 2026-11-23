@@ -54,7 +54,9 @@ Completed results are committed to SQLite one item at a time. A stop returns the
 
 With the item limit set to zero, the runner continues through all currently queued work until complete or stopped. A nonzero item limit is an explicit batch size, useful for reviewing a large repository over several runs. Three consecutive inference errors stop the current run to avoid hammering an unavailable server; unattempted items stay queued.
 
-Refreshing preserves completed work for unchanged sources. Changed files invalidate their old chunks and generate new queued work. Removed or newly ignored files are retired after a successful full traversal. Cancellation or a traversal error prevents deletion reconciliation, so a partial scan cannot erase the previous manifest.
+Refreshing preserves completed work for unchanged sources when the review instruction, model and endpoint match. Changing the question or model starts a separate review of the same extracted text. Switching back resumes the matching review. Findings from older versions that did not record the review objective remain available in their exported run reports.
+
+Changed files invalidate their old chunks and generate new queued work. Removed or newly ignored files are retired after a successful full traversal. Cancellation or a traversal error prevents deletion reconciliation, so a partial scan cannot erase the previous manifest.
 
 Source hashes are checked before and after each model review and again before the final coverage record. A file changed during inference is marked stale, and the old verdict is not counted as a current completed review.
 

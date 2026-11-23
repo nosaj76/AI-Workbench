@@ -234,7 +234,7 @@ fn saving_divergent_window_edits_keeps_both_conversations() {
     assert_ne!(app.session.id, original_id);
     assert_eq!(other.load(&original_id).unwrap().title, newer.title);
     assert_eq!(other.load(&app.session.id).unwrap().title, "Edited here · recovered edits");
-    assert_eq!(Settings::load(dir.path()).unwrap().last_session.as_deref(), Some(app.session.id.as_str()));
+    assert_eq!(crate::persistence::read_json::<String>(&dir.path().join("last-session.json"), 1024).unwrap(), app.session.id);
 }
 
 #[test]
@@ -1448,4 +1448,87 @@ fn related_searches_from_the_latest_turn_are_offered_under_the_answer() {
     frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(chip), click(chip, true)]);
     frame(&mut app, &ctx, size, vec![click(chip, false)]);
     assert_eq!(app.input, "Search the web for arctic fox");
+}
+
+#[test]
+fn failed_conversation_write_keeps_the_open_session_and_draft() {
+    let (dir, _, mut app) = fixture();
+    app.demo = false;
+    assert!(app.persist());
+    let current = app.session.id.clone();
+    let mut next = Session::default();
+    app.store.save(&mut next).unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("workbench.sqlite3")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_save BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;").unwrap();
+    app.session.title = "Unsaved edit".into();
+    app.input = "Unsent message".into();
+    app.new_conversation();
+    app.open_conversation(&next.id);
+    assert_eq!(app.session.id, current);
+    assert_eq!(app.session.title, "Unsaved edit");
+    assert_eq!(app.input, "Unsent message");
+    assert!(app.dirty);
+    assert!(app
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("simulated write failure"));
+    db.execute_batch("DROP TRIGGER fail_save").unwrap();
+    app.open_conversation(&next.id);
+    assert_eq!(app.session.id, next.id);
+    assert_eq!(app.store.load(&current).unwrap().title, "Unsaved edit");
+}
+
+#[test]
+fn closing_an_older_window_preserves_newer_approval_preferences() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = egui::Context::default();
+    let mut settings = Settings {
+        auto_approve_commands: true,
+        ..Default::default()
+    };
+    settings.save(dir.path()).unwrap();
+    let mut older = Workbench::from_context(&ctx, dir.path().into(), false).unwrap();
+    settings.auto_approve_commands = false;
+    settings.save(dir.path()).unwrap();
+    eframe::App::on_exit(&mut older, None);
+    assert!(!Settings::load(dir.path()).unwrap().auto_approve_commands);
+    let reopened = Workbench::from_context(&ctx, dir.path().into(), false).unwrap();
+    assert_eq!(reopened.session.id, older.session.id);
+}
+
+#[test]
+fn model_comparison_keeps_the_regular_model_across_restart() {
+    let (dir, _, mut app) = fixture();
+    app.demo = false;
+    app.session = Session::default();
+    app.session.selected_model = Some("selected".into());
+    for (comparison, model) in [
+        (false, "regular"),
+        (true, "candidate-a"),
+        (true, "candidate-b"),
+    ] {
+        app.compare_active = comparison;
+        app.chat_tx.send(ChatEvent::Begin(model.into())).unwrap();
+        app.chat_tx
+            .send(ChatEvent::Stats(json!({"eval_count": 1})))
+            .unwrap();
+        app.chat_tx
+            .send(ChatEvent::Complete(ChatMessage {
+                role: "assistant".into(),
+                content: "An answer".into(),
+                ..Default::default()
+            }))
+            .unwrap();
+        app.receive_events();
+    }
+    assert!(app.persist());
+    let reopened =
+        Workbench::from_context(&egui::Context::default(), dir.path().into(), false).unwrap();
+    assert_eq!(reopened.session.entries.len(), 3);
+    assert_eq!(
+        reopened.previous_chat_model("selected").as_deref(),
+        Some("regular")
+    );
+    assert!(reopened.previous_chat_model("new selection").is_none());
 }

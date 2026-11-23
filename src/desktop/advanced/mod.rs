@@ -60,6 +60,7 @@ enum UiEvent {
     Finished(Result<(String, Vec<PathBuf>), String>),
     Reviews {
         root: PathBuf,
+        identity: String,
         coverage: ReviewCoverage,
         items: Vec<ReviewItem>,
     },
@@ -94,6 +95,7 @@ pub struct AdvancedUi {
     review_instruction: String,
     review_chunk: usize,
     review_batch: usize,
+    review_result_identity: String,
     review_coverage: Option<ReviewCoverage>,
     review_items: Vec<ReviewItem>,
     review_selected: String,
@@ -120,7 +122,7 @@ pub struct AdvancedUi {
     note_query: String,
     note_rows: Vec<crate::notes::NoteSummary>,
     note_loaded: bool,
-    note_open: Option<(String, String)>,
+    note_open: Option<notes::NoteDraft>,
     note_review_pending: bool,
     memory_edit: Option<(String, String)>,
     memory_new_key: String,
@@ -178,6 +180,7 @@ impl AdvancedUi {
             review_instruction: "Review correctness, error handling, security boundaries, maintainability and missing behavior. Cite exact file and source-line ranges. Distinguish observed bugs from hypotheses. Do not claim tests were run.".into(),
             review_chunk: 6000,
             review_batch: 0,
+            review_result_identity: String::new(),
             review_coverage: None,
             review_items: vec![],
             review_selected: String::new(),
@@ -362,10 +365,12 @@ impl AdvancedUi {
                 }
                 UiEvent::Reviews {
                     root,
+                    identity,
                     coverage,
                     items,
                 } => {
                     if crate::memory::scope(Some(&root)) == self.workspace_key {
+                        self.review_result_identity = identity;
                         self.review_coverage = Some(coverage);
                         self.review_items = items;
                     }

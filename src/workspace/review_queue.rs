@@ -142,6 +142,12 @@ impl ReviewQueue {
                text TEXT NOT NULL, state TEXT NOT NULL, report TEXT NOT NULL DEFAULT '',
                error TEXT, model TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
                updated_at TEXT NOT NULL, lease_owner TEXT NOT NULL DEFAULT '');
+             CREATE TABLE IF NOT EXISTS review_objectives (
+               workspace TEXT PRIMARY KEY, identity TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS review_saved_findings (
+               identity TEXT NOT NULL, item_id TEXT NOT NULL, state TEXT NOT NULL,
+               report TEXT NOT NULL, error TEXT, model TEXT NOT NULL, attempts INTEGER NOT NULL,
+               PRIMARY KEY(identity,item_id));
              CREATE INDEX IF NOT EXISTS review_pending ON review_items(workspace,state,path,ordinal);
              CREATE INDEX IF NOT EXISTS review_generation ON review_items(workspace,path,generation);"
         )?;
@@ -169,6 +175,51 @@ impl ReviewQueue {
     ) -> Result<RefreshStats> {
         let _lock = self.lock(workspace)?;
         self.refresh_unlocked(workspace, chunk_chars, cancel, Some(events))
+    }
+
+    /// The extracted chunks are independent of the model and review objective.
+    pub fn refresh_for_review(
+        &mut self, workspace: &Workspace, request: &ReviewRequest, cancel: &AtomicBool,
+        events: &Sender<AgentEvent>,
+    ) -> Result<RefreshStats> {
+        let _lock = self.lock(workspace)?;
+        self.activate_objective(workspace, &request.identity())?;
+        self.refresh_unlocked(workspace, request.chunk_chars, cancel, Some(events))
+    }
+
+    fn activate_objective(&mut self, workspace: &Workspace, identity: &str) -> Result<()> {
+        let root = key(workspace);
+        let tx = self.conn.transaction()?;
+        let previous: Option<String> = tx.query_row(
+            "SELECT identity FROM review_objectives WHERE workspace=?1", [&root], |r| r.get(0)
+        ).optional()?;
+        if previous.as_deref() == Some(identity) {
+            return Ok(());
+        }
+        if let Some(previous) = previous {
+            tx.execute(
+                "INSERT OR REPLACE INTO review_saved_findings
+                 SELECT ?2,id,state,report,error,model,attempts FROM review_items
+                 WHERE workspace=?1 AND state<>'stale'", params![root,previous]
+            )?;
+        }
+        // Old databases did not record an objective. Their exported run reports
+        // remain available, but their findings cannot attest to the new question.
+        tx.execute(
+            "UPDATE review_items SET state=CASE WHEN state='stale' THEN 'stale' ELSE 'queued' END,
+             report='',error=NULL,model='',attempts=0,lease_owner='' WHERE workspace=?1", [&root]
+        )?;
+        tx.execute(
+            "UPDATE review_items AS i SET state=CASE WHEN f.state='running' THEN 'queued' ELSE f.state END,
+             report=f.report,error=f.error,model=f.model,attempts=f.attempts
+             FROM review_saved_findings f WHERE i.workspace=?1 AND i.state='queued'
+             AND f.item_id=i.id AND f.identity=?2", params![root,identity]
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO review_objectives VALUES(?1,?2)", params![root,identity]
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn refresh_unlocked(
@@ -542,6 +593,15 @@ pub struct ReviewRequest {
 }
 
 impl ReviewRequest {
+    pub fn identity(&self) -> String {
+        Self::objective_identity(&self.instruction, &self.model, &self.settings.base_url)
+    }
+
+    pub fn objective_identity(instruction: &str, model: &str, endpoint: &str) -> String {
+        // Bump when the chunk review prompt or its interpretation changes.
+        digest(&serde_json::to_vec(&("chunk-review/v1", instruction, model, endpoint)).expect("serializing strings cannot fail"))
+    }
+
     pub fn new(settings: Settings, workspace: PathBuf, data_dir: PathBuf, model: String) -> Self {
         Self {
             settings, workspace, data_dir, model,
@@ -580,6 +640,7 @@ pub fn run_review(
     let workspace = Workspace::new(request.workspace.clone())?;
     let mut queue = ReviewQueue::open(request.data_dir.join("review.sqlite3"))?;
     let _lock = queue.lock(&workspace)?;
+    queue.activate_objective(&workspace, &request.identity())?;
     let recovered = queue.recover_interrupted(&workspace)?;
     if recovered > 0 {
         agents::status(
@@ -999,6 +1060,38 @@ mod tests {
             .iter()
             .all(|i| i.path != "b.md" && i.path != ".env"));
         assert_eq!(q.coverage(&ws).unwrap().removed_files, 1);
+    }
+
+    #[test]
+    fn objectives_have_separate_findings_and_can_resume_on_identical_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        let ws = Workspace::new(root.clone()).unwrap();
+        let mut req = ReviewRequest::new(Settings::default(), root, tmp.path().into(), "first".into());
+        let mut q = ReviewQueue::open(tmp.path().join("reviews.db")).unwrap();
+        let first = req.identity();
+        q.activate_objective(&ws, &first).unwrap();
+        q.refresh(&ws, 500, &AtomicBool::new(false)).unwrap();
+        let item = q.claim(&ws, "worker").unwrap().unwrap();
+        q.finish(&item.id, "worker", "done", "First answer", None, "first").unwrap();
+
+        req.instruction = "A different task".into();
+        let second = req.identity();
+        q.activate_objective(&ws, &second).unwrap();
+        assert_eq!(q.coverage(&ws).unwrap().queued, 1);
+        let item = q.claim(&ws, "worker").unwrap().unwrap();
+        assert!(item.report.is_empty());
+        q.finish(&item.id, "worker", "done", "Second answer", None, "first").unwrap();
+        req.model = "other".into();
+        q.activate_objective(&ws, &req.identity()).unwrap();
+        assert_eq!(q.coverage(&ws).unwrap().done, 0);
+        for (identity, report) in [(first, "First answer"), (second, "Second answer")] {
+            q.activate_objective(&ws, &identity).unwrap();
+            assert!(q.coverage(&ws).unwrap().complete());
+            assert_eq!(q.items(&ws, Some("done"), 1).unwrap()[0].report, report);
+        }
     }
 
     #[test]

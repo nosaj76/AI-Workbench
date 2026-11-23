@@ -527,14 +527,28 @@ fn cached_index(
             break;
         }
     }
-    let listing = chosen.expect("at least one pass runs");
+    let mut listing = chosen.expect("at least one pass runs");
     let scanned = listing.files.len();
     // The index is rebuilt only when a source file was added, removed or changed.
     let signature = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for f in &listing.files {
-            (&f.path, f.size, f.modified).hash(&mut hasher);
+            (&f.path, f.size, f.modified, f.change).hash(&mut hasher);
+            // Where both clocks expose only whole seconds, identical metadata
+            // can conceal a same-size rewrite. Bound this fallback by the same
+            // deadline as parsing; precise ctime avoids it on Linux filesystems.
+            let fractional_mtime = f.modified
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|t| t.subsec_nanos() != 0);
+            if !fractional_mtime && !f.change.is_some_and(|(_, _, ns)| ns != 0) {
+                if Instant::now() >= deadline {
+                    listing.complete = false;
+                    break;
+                }
+                workspace.read_text(&f.path, limits.max_file_bytes as usize)
+                    .ok().map(|doc| doc.text).hash(&mut hasher);
+            }
         }
         listing.complete.hash(&mut hasher);
         hasher.finish()
@@ -1169,6 +1183,20 @@ mod tests {
         let (rebuilt, _) = cached_index(&workspace, &Limits::default(), None).unwrap();
         assert!(!Arc::ptr_eq(&first, &rebuilt));
         assert!(rebuilt.files.contains(&"src/new.rs".to_string()));
+    }
+
+    #[test]
+    fn same_length_rename_with_identical_coarse_mtime_invalidates_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let path = dir.path().join("module.rs");
+        let time = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for name in ["first", "later"] {
+            fs::write(&path, format!("pub fn {name}() {{}}")).unwrap();
+            fs::File::open(&path).unwrap().set_modified(time).unwrap();
+            let (index, _) = cached_index(&workspace, &Limits::default(), None).unwrap();
+            assert!(index.name_files.contains_key(name));
+        }
     }
 
     #[test]

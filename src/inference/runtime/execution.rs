@@ -29,7 +29,13 @@ pub(super) async fn run_chat(
         .find(|m| m.role == "user")
         .map(|m| crate::memory::user_text(&m.content))
         .unwrap_or_default();
-    let explicit_web_search = explicitly_requests_web_search(&memory_user);
+    let search_intent = web_search_intent(&memory_user);
+    let explicit_web_search = search_intent == WebSearchIntent::Requested;
+    let web_prohibited = search_intent == WebSearchIntent::Prohibited;
+    if web_prohibited {
+        // Children and newly constructed engines inherit the turn's network preference.
+        job.settings.network_tools = false;
+    }
     // A delegated child's task is written by a planner or by Workbench and may
     // quote terminal commands as evidence (the self-review digests whole
     // conversations). Enforcing a terminal action there would discard the
@@ -81,6 +87,11 @@ pub(super) async fn run_chat(
         .unwrap_or_default();
     if job.settings.agents_enabled && project.is_some() && engine.is_some() {
         definitions.push(delegation_tool_definition());
+    }
+    if web_prohibited {
+        definitions.retain(|definition| {
+            !web_access_tool(definition["function"]["name"].as_str().unwrap_or(""))
+        });
     }
     if explicit_web_search {
         if !definitions.iter().any(|definition| {
@@ -135,40 +146,7 @@ pub(super) async fn run_chat(
             job.model
         )));
     }
-    // Keep the model that answered this conversation's earlier turns (while the
-    // user's selection is unchanged), unless this turn needs a capability it lacks.
-    let mut kept_conversation_model = false;
     if job.settings.model_routing && !pinned_by_profile {
-        if let Some(previous) = job
-            .settings
-            .conversation_model
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-        {
-            let needs_vision = job.messages.iter().any(|m| !m.images.is_empty());
-            let capable = match client.show(&previous).await {
-                Ok(info) => {
-                    let caps: Vec<&str> = info
-                        .get("capabilities")
-                        .and_then(Value::as_array)
-                        .map(|c| c.iter().filter_map(Value::as_str).collect())
-                        .unwrap_or_default();
-                    (!need_tools || caps.contains(&"tools"))
-                        && (!needs_vision || caps.contains(&"vision"))
-                }
-                Err(_) => false,
-            };
-            if capable {
-                job.model = previous;
-                kept_conversation_model = true;
-                let _ = tx.send(ChatEvent::Status(format!(
-                    "Keeping {} for this conversation (it answered the earlier turns)",
-                    job.model
-                )));
-            }
-        }
-    }
-    if job.settings.model_routing && !pinned_by_profile && !kept_conversation_model {
         let _ = tx.send(ChatEvent::Status(
             "Selecting a compatible local model…".into(),
         ));
@@ -289,7 +267,7 @@ pub(super) async fn run_chat(
                                 StreamEvent::Thinking(text) => ChatEvent::Thinking(text),
                                 StreamEvent::Stats(stats) => {
                                     let _ = crate::routing::observe(&data_dir, &job.model, &stats);
-                                    ChatEvent::Stats(stats)
+                                    ChatEvent::Stats(completion_stats(stats, &options))
                                 }
                             };
                             if tx.send(event).is_err() {
@@ -302,6 +280,9 @@ pub(super) async fn run_chat(
                 let response = response?;
                 if !response.tool_calls.is_empty() {
                     bail!("The dedicated translator returned unsupported tool calls; no action was executed");
+                }
+                if response.content.trim().is_empty() {
+                    bail!("The translation model returned no translation text. Retry with a smaller passage or select another model.");
                 }
                 let _ = tx.send(ChatEvent::Complete(response));
                 return Ok(());
@@ -432,6 +413,13 @@ pub(super) async fn run_chat(
     }
     let mut options = options(&job.settings)?;
     let mut messages = job.messages;
+    if web_prohibited {
+        messages.insert(0, ChatMessage {
+            role: "system".into(),
+            content: "The user requested no web access for this turn. Answer using local evidence, and explain if a claim needs external verification.".into(),
+            ..Default::default()
+        });
+    }
     if explicit_web_search {
         let instruction = ChatMessage {
             role: "system".into(),
@@ -873,6 +861,14 @@ pub(super) async fn run_chat(
     // Tokens the character-based budget plans with; calibrated each round from
     // Ollama's measured prompt size (see context::calibrated_budget_ctx).
     let mut budget_ctx = context::remembered_budget_ctx(&job.model, job.settings.num_ctx);
+    context::fit_tool_definitions(
+        &mut definitions,
+        &messages,
+        &memory_user,
+        explicit_web_search || code_request,
+        budget_ctx,
+        job.settings.num_predict,
+    )?;
     for round in 0..=limit {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -1033,31 +1029,7 @@ pub(super) async fn run_chat(
                         StreamEvent::Stats(v) => {
                             response_stats = v.clone();
                             let _ = crate::routing::observe(&data_dir, &job.model, &v);
-                            let mut v = v;
-                            // Ollama reports `length` when the reply hit the output
-                            // token limit. The text then ends mid-sentence, so it must
-                            // never be saved as a finished answer.
-                            if v.get("done_reason").and_then(Value::as_str) == Some("length") {
-                                v["incomplete"] = serde_json::json!(true);
-                                v["interruption_kind"] = serde_json::json!("output_limit");
-                                let used = v["prompt_eval_count"].as_u64().unwrap_or(0)
-                                    + v["eval_count"].as_u64().unwrap_or(0);
-                                let window_full = options.num_predict <= 0
-                                    || used + 64 >= u64::from(options.num_ctx);
-                                v["failure_reason"] = if window_full {
-                                    serde_json::json!(format!(
-                                        "This reply stopped because the context window ({} tokens) is full: the conversation so far used {} and the reply the rest. It is not finished. Start a new chat, or raise Context tokens in Settings, then reply \"continue\".",
-                                        options.num_ctx,
-                                        v["prompt_eval_count"].as_u64().unwrap_or(0)
-                                    ))
-                                } else {
-                                    serde_json::json!(format!(
-                                        "This reply stopped at the output token limit ({}), not because it was finished. Reply \"continue\" to get the rest, or raise Output token limit in Settings.",
-                                        options.num_predict
-                                    ))
-                                };
-                            }
-                            ChatEvent::Stats(v)
+                            ChatEvent::Stats(completion_stats(v, &options))
                         }
                     };
                     if tx.send(outgoing).is_err() {
@@ -1134,6 +1106,14 @@ pub(super) async fn run_chat(
                 options.num_ctx = reduced;
                 job.settings.num_ctx = reduced;
                 budget_ctx = budget_ctx.min(reduced);
+                context::fit_tool_definitions(
+                    &mut definitions,
+                    &messages,
+                    &memory_user,
+                    explicit_web_search || code_request,
+                    budget_ctx,
+                    job.settings.num_predict,
+                )?;
                 continue;
             }
             Err(error)
@@ -1797,8 +1777,9 @@ pub(super) async fn run_chat(
                 new_requests_this_round += 1;
                 let _ = tx.send(ChatEvent::Status(format!("Tool: {}", function.name)));
             }
-            let outside_web_scope = explicit_web_search
-                && !matches!(function.name.as_str(), "web_search" | "fetch_url");
+            let outside_web_scope = (web_prohibited && web_access_tool(&function.name))
+                || (explicit_web_search
+                    && !matches!(function.name.as_str(), "web_search" | "fetch_url"));
             // Small models guess URLs from memory (often 404s). Only fetch a URL
             // that a search result or the user actually supplied.
             let refused_search =
@@ -1846,7 +1827,7 @@ pub(super) async fn run_chat(
             let mut result = if outside_web_scope {
                 serde_json::json!({
                     "denied": true, "executed": false,
-                    "reason": "This turn is an explicit web search. Local files, commands and delegation are unavailable; call the native web_search tool instead."
+                    "reason": if web_prohibited { "The user requested no web access for this turn. Answer using local evidence." } else { "This turn is an explicit web search. Local files, commands and delegation are unavailable; call the native web_search tool instead." }
                 })
             } else if refused_search {
                 serde_json::json!({

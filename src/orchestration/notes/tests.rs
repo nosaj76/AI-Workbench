@@ -1024,3 +1024,43 @@ fn chat_context_shows_consensus_and_withholds_what_the_models_called_wrong() {
         "{text}"
     );
 }
+
+#[test]
+fn stale_editor_cannot_erase_a_background_fact_or_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let editor = NoteStore::open(dir.path()).unwrap();
+    let background = NoteStore::open(dir.path()).unwrap();
+    let first = "The pollen grain contains the male gametophyte.";
+    let slug = editor
+        .absorb("Flowering plants", &[fact(first, BASIS_WEB, &[])], &[])
+        .unwrap()
+        .slug;
+    let path = editor.path(&slug);
+    let original = fs::read_to_string(&path).unwrap();
+    let second = "Flower petals can attract pollinators with bright colours.";
+    background
+        .absorb("Flowering plants", &[fact(second, BASIS_WEB, &[])], &[])
+        .unwrap();
+    background
+        .apply_reviews(
+            &slug,
+            &[(
+                first.into(),
+                Consensus {
+                    agree: 2,
+                    disagree: 0,
+                    unsure: 0,
+                },
+            )],
+            "Two reviewers agreed",
+        )
+        .unwrap();
+    let updated = fs::read_to_string(&path).unwrap();
+    assert!(updated.contains(second));
+    assert!(updated.contains("Two reviewers agreed"));
+    assert!(editor.save_edit(&slug, &original, "my draft").is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), updated);
+    let edited = updated.replace("Flowering plants", "Flowering plants in spring");
+    editor.save_edit(&slug, &updated, &edited).unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), edited);
+}

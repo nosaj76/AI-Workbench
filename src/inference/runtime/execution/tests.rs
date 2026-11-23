@@ -670,6 +670,8 @@ mod finalization_tests {
 
     #[test]
     fn explicit_web_search_intent_is_narrow_and_honors_opt_outs() {
+        let explicitly_requests_web_search =
+            |text: &str| web_search_intent(text) == WebSearchIntent::Requested;
         assert!(explicitly_requests_web_search("Search the web about Linux"));
         assert!(explicitly_requests_web_search(
             "Please browse online for current sources"

@@ -298,6 +298,24 @@ const PHRASING_WORDS: &[&str] = &[
 /// The public bag-of-words normalizer also serves note and knowledge searches.
 fn question_key(question: &str) -> String {
     let lower = question.to_lowercase();
+    // Mathematical and code expressions are order- and punctuation-sensitive.
+    // Keep their wording intact, including operands such as “a” and “i”.
+    let operators = [
+        '+', '-', '*', '/', '%', '^', '=', '<', '>', '|', '&', '~', '×', '÷', '−',
+        '±', '≤', '≥', '≠', '≈', '√', '(', ')', '[', ']',
+    ];
+    let decimal = lower.as_bytes().windows(3).any(|w| {
+        w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit()
+    });
+    if lower.contains(operators) || decimal {
+        let expression = lower
+            .trim()
+            .trim_end_matches('?')
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("= {expression}");
+    }
     let mut words = Vec::new();
     let mut has_subject = false;
     for word in lower.split(|c: char| !(c.is_alphanumeric() || matches!(c, '+' | '#'))) {
@@ -317,6 +335,10 @@ fn question_key(question: &str) -> String {
 fn similarity(a: &str, b: &str) -> f64 {
     if a == b {
         return 1.0;
+    }
+    if a.starts_with("= ") || b.starts_with("= ") {
+        // Even identical word and operator sets can express different calculations.
+        return 0.0;
     }
     let significant = |text: &str| -> BTreeSet<String> {
         let all: BTreeSet<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
@@ -656,9 +678,9 @@ impl QaCache {
                 id UNINDEXED, question, answer, explanation, topic, tokenize='unicode61'
              );",
         )?;
-        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 0 {
+        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 2 {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 0 {
+            if tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 2 {
                 let questions = {
                     let mut stmt = tx.prepare("SELECT id,json_extract(record,'$.question') FROM qa_library")?;
                     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
@@ -669,7 +691,7 @@ impl QaCache {
                 for (id, question) in questions {
                     tx.execute("UPDATE qa_library SET normalized=?1 WHERE id=?2", params![question_key(&question), id])?;
                 }
-                tx.pragma_update(None, "user_version", 1)?;
+                tx.pragma_update(None, "user_version", 2)?;
             }
             tx.commit()?;
         }
@@ -1191,6 +1213,31 @@ mod tests {
         let second = cache.store(save(reverse, "divide by 1.8"), 30).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(cache.lookup(reverse).unwrap().unwrap().id, second.id);
+    }
+
+    #[test]
+    fn arithmetic_answers_survive_rekeying_and_never_match_other_expressions() {
+        let dir = tempfile::tempdir().unwrap();
+        let subtraction = "What is 8 - 2?";
+        let division = "What is 8 / 2?";
+        let cache = QaCache::open(dir.path()).unwrap();
+        let saved = cache.store(new(subtraction, "6", "6", &[], AnswerKind::Factual, "math"), 30).unwrap();
+        cache.conn.execute("UPDATE qa_library SET normalized='8 2'", []).unwrap();
+        cache.conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(cache);
+
+        let cache = QaCache::open(dir.path()).unwrap();
+        assert_eq!(cache.lookup(subtraction).unwrap().unwrap().id, saved.id);
+        assert!(cache.lookup(division).unwrap().is_none());
+        cache.store(new(division, "4", "4", &[], AnswerKind::Factual, "math"), 30).unwrap();
+        assert_eq!(cache.lookup(division).unwrap().unwrap().answer, "4");
+        assert_eq!(cache.lookup(subtraction).unwrap().unwrap().answer, "6");
+        for other in ["2 / 8", "8 * 2", "8.2"] {
+            assert!(cache.lookup(other).unwrap().is_none());
+        }
+        let original = question_key("Please calculate the final result of the expression (a-b)/c");
+        let reversed = question_key("Please calculate the final result of the expression (b-a)/c");
+        assert_eq!(similarity(&original, &reversed), 0.0);
     }
 
     #[test]

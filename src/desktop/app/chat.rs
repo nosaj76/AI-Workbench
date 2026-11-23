@@ -89,21 +89,14 @@ impl Workbench {
         let mut job_settings = self.settings.clone();
         // While the selection is unchanged, keep the model that answered before.
         let selected = self.settings.active_model().to_string();
-        if self.session.selected_model.as_deref() == Some(selected.as_str()) {
-            job_settings.conversation_model = self
-                .session
-                .entries
-                .iter()
-                .rev()
-                .find(|e| e.message.role == "assistant" && !e.model.trim().is_empty())
-                .map(|e| e.model.clone());
-        }
-        self.session.selected_model = Some(selected);
         if self.compare_active {
             job_settings.tools_enabled = false;
             job_settings.agents_enabled = false;
             job_settings.automatic_memory = false;
             job_settings.model_routing = false;
+        } else {
+            job_settings.conversation_model = self.previous_chat_model(&selected);
+            self.session.selected_model = Some(selected);
         }
         runtime::spawn_chat(
             ChatJob {
@@ -117,6 +110,16 @@ impl Workbench {
             self.chat_tx.clone(),
             self.cancel.clone(),
         );
+    }
+
+    pub(super) fn previous_chat_model(&self, selected: &str) -> Option<String> {
+        if self.session.selected_model.as_deref() != Some(selected) {
+            return None;
+        }
+        self.session.entries.iter().rev().find(|entry| {
+            entry.message.role == "assistant" && !entry.comparison_candidate
+                && !entry.model.trim().is_empty()
+        }).map(|entry| entry.model.clone())
     }
 
     pub(super) fn regenerate(&mut self) {
@@ -133,7 +136,9 @@ impl Workbench {
             branch.id = uuid::Uuid::new_v4().to_string();
             branch.title = format!("{} · retry", branch.title);
             branch.entries.truncate(index + 1);
-            self.persist();
+            if !self.persist() {
+                return;
+            }
             self.session = branch;
             let mut messages = vec![ChatMessage {
                 role: "system".into(),
@@ -524,7 +529,6 @@ impl Workbench {
                     if ui.button("Stop").clicked() {
                         self.cancel.store(true, Ordering::Relaxed);
                         self.compare_queue.clear();
-                        self.compare_active = false;
                         self.approve(false);
                     }
                 } else {
@@ -770,8 +774,10 @@ impl Workbench {
             self.input = format!("Search the web for {suggestion}");
         }
         if let Some(index) = branch {
+            if !self.persist() {
+                return;
+            }
             self.code_export_preview = None;
-            self.persist();
             let entry = self.session.entries[index].clone();
             self.session.id = uuid::Uuid::new_v4().to_string();
             self.session.title = format!("{} · branch", self.session.title);

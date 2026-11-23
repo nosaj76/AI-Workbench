@@ -170,6 +170,7 @@ impl StudioUi {
         egui::CollapsingHeader::new("Local program and model settings").show(ui, |ui| {
             text_row(ui, "FFmpeg", &mut self.config.media.ffmpeg);
             text_row(ui, "ffprobe", &mut self.config.media.ffprobe);
+            text_row(ui, "PDF page inspector", &mut self.config.media.pdfinfo);
             text_row(ui, "PDF renderer", &mut self.config.media.pdftoppm);
             text_row(ui, "Tesseract", &mut self.config.media.tesseract);
             text_row(ui, "Whisper executable", &mut self.config.media.whisper);

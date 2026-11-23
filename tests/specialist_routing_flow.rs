@@ -70,7 +70,7 @@ impl Server {
                                 if !delay.is_zero() { thread::sleep(delay); }
                             }
                             let response = match path.as_str() {
-                                "/api/tags" => json!({"models":metadata.iter().map(|(name, info)| json!({"name":name,"size":2_000_000_000_u64,"details":info["details"]})).collect::<Vec<_>>()}),
+                                "/api/tags" => json!({"models":metadata.iter().map(|(name, info)| json!({"name":name,"size":info["size"].as_u64().unwrap_or(2_000_000_000),"details":info["details"]})).collect::<Vec<_>>()}),
                                 "/api/ps" => json!({"models":[]}),
                                 "/api/show" => metadata.get(body["model"].as_str().unwrap()).expect("unknown model").clone(),
                                 "/api/chat" => responder(&body),
@@ -236,6 +236,7 @@ struct Outcome {
     // Native assistant tool-call messages are part of the conversation, but are
     // not user-facing final answers (their content may legitimately be empty).
     native_tool_calls: usize,
+    stats: Vec<Value>,
     errors: Vec<String>,
 }
 fn finish(rx: mpsc::Receiver<ChatEvent>) -> Outcome {
@@ -255,6 +256,7 @@ fn finish(rx: mpsc::Receiver<ChatEvent>) -> Outcome {
                     out.native_tool_calls += message.tool_calls.len();
                 }
             }
+            ChatEvent::Stats(stats) => out.stats.push(stats),
             ChatEvent::Error(error) => out.errors.push(error),
             ChatEvent::Approval { reply, .. } => {
                 let _ = reply.send(false);
@@ -325,6 +327,69 @@ fn translation_handoff_has_one_exact_native_message_and_no_tools_or_memory() {
         serde_json::from_slice(&std::fs::read(dir.path().join("last-route.json")).unwrap())
             .unwrap();
     assert_eq!(recorded["model"], "translategemma:4b-it-q4_K_M");
+}
+
+#[test]
+fn limited_or_empty_translation_is_never_reported_as_finished() {
+    for empty in [false, true] {
+        let server = Server::new(
+            move |body| {
+                if body["model"] == "coordinator:4b" {
+                    answer(&json!({"ready":true,"source_code":"en","target_code":"fr","text":"Hello, friend!"}).to_string())
+                } else if empty {
+                    json!({"message":{"role":"assistant","content":"","thinking":"hmm"},"done":true})
+                } else {
+                    json!({"message":{"role":"assistant","content":"Bonjour,"},"done":true,"done_reason":"length"})
+                }
+            },
+            Duration::ZERO,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let result = run(job(
+            settings(&server),
+            dir.path(),
+            "Translate from English to French: Hello, friend!",
+            false,
+        ));
+        if empty {
+            assert!(result.answers.is_empty());
+            assert!(result
+                .errors
+                .iter()
+                .any(|s| s.contains("no translation text")));
+        } else {
+            assert_eq!(result.answers, ["Bonjour,"]);
+            assert!(result
+                .stats
+                .iter()
+                .any(|s| s["incomplete"] == true && s["interruption_kind"] == "output_limit"));
+        }
+    }
+}
+
+#[test]
+fn continuity_respects_the_current_file_size_and_parameter_limits() {
+    for (size_limit, parameter_limit, expected) in [
+        (8.0, 10.0, "coder:7b"),
+        (3.0, 10.0, "coordinator:4b"),
+        (8.0, 5.0, "coordinator:4b"),
+    ] {
+        let mut metadata = models();
+        metadata.get_mut("coder:7b").unwrap()["size"] = json!(5_000_000_000_u64);
+        let server = Server::with_models(metadata, |_| answer("Ready"), Duration::ZERO);
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = settings(&server);
+        settings.conversation_model = Some("coder:7b".into());
+        settings.routing_json = serde_json::to_string(&RoutingConfig {
+            max_model_gib: size_limit,
+            max_parameters_b: parameter_limit,
+            ..config()
+        })
+        .unwrap();
+        let result = run(job(settings, dir.path(), "Tell me more", false));
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.models, [expected]);
+    }
 }
 
 #[test]

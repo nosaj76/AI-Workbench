@@ -30,11 +30,12 @@ impl Workbench {
         if self.demo {
             bail!("Demo mode does not save application settings");
         }
+        // Persist the complete validated snapshot before changing running state.
         if self.settings_corrupt {
-            crate::persistence::backup_existing(&self.dir.join("settings.json"))?;
+            candidate.save_after_recovery(&self.dir)?;
+        } else {
+            candidate.save(&self.dir)?;
         }
-        // Persist the complete validated snapshot BEFORE changing running state.
-        candidate.save(&self.dir)?;
         let endpoint_changed = candidate.base_url != self.settings.base_url
             || candidate.allow_remote != self.settings.allow_remote;
         self.settings = candidate;

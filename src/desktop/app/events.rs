@@ -101,6 +101,7 @@ impl Workbench {
                         ..Default::default()
                     });
                     entry.model = model;
+                    entry.comparison_candidate = self.compare_active;
                     self.session.entries.push(entry);
                     self.streaming = Some(self.session.entries.len() - 1);
                     self.status = "Generating locally…".into();
@@ -369,6 +370,8 @@ impl Workbench {
                             .iter()
                             .find(|m| !m.name.contains("embed") && !m.name.contains("-cloud"))
                         {
+                            // This is only the initial fallback. Every window can derive
+                            // it from Ollama without rewriting preferences from its snapshot.
                             self.settings.model = model.name.clone();
                         }
                     }
@@ -468,7 +471,9 @@ impl Workbench {
                 }
                 WorkEvent::Status(s) => self.status = s,
                 WorkEvent::Import(mut session) => {
-                    self.persist();
+                    if !self.persist() {
+                        continue;
+                    }
                     // Importing a conversation that is still stored must not collide
                     // with the original; keep both.
                     if self.store.load(&session.id).is_ok() {

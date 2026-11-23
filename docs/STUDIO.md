@@ -17,7 +17,7 @@ already reviewed snapshot. There is one active Studio worker at a time.
 | Image generation | Text-to-image, input-image variation, negative prompts, seeds, size, steps, batches, model selection, saved real images and thumbnails | ComfyUI API, AUTOMATIC1111 API, or `sd-cli`; matching model weights |
 | Document activities | Summary, comparison, study guide, podcast script, rewrite, translation | A selected local Ollama text model |
 | Report exports | Markdown, plain text and DOCX, with source/chunk coverage | Built into Rust |
-| PDF OCR | Render selected pages, recognize each page, retain page images and original page numbers | Poppler `pdftoppm`, Tesseract and its language data |
+| PDF OCR | Render selected pages, recognize each page, retain page images and original page numbers | Poppler `pdfinfo` and `pdftoppm`, Tesseract and its language data |
 | Image OCR | Recognize an explicitly selected local image | Tesseract and its language data |
 | Transcription | Convert audio/video audio to mono WAV, transcribe, save text/SRT/JSON, then summarize the transcript | FFmpeg, whisper.cpp `whisper-cli`, a local Whisper model; Ollama for the optional summary |
 | Speech | Text to a saved WAV file | eSpeak NG, or Piper and a local voice model |
@@ -198,7 +198,8 @@ selected model. Document text is treated as evidence, not executable commands.
 
 Choose the first and last PDF page, DPI and installed Tesseract language code.
 At most 100 pages are rendered per run, at 50–300 DPI with a 2,000-pixel maximum
-page dimension. Only actual rendered pages are recognized, and headings retain
+page dimension. Studio reads the dimensions of each requested page before rendering
+so smaller pages retain the selected DPI. Only actual rendered pages are recognized, and headings retain
 the PDF's original page numbers. A request extending beyond the end of the PDF
 produces a coverage warning. Page images are retained for inspection, and OCR
 text is saved as `ocr.md`. Single-image OCR saves `ocr.txt`.

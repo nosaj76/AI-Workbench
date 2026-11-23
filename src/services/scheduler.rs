@@ -251,6 +251,10 @@ pub struct ScheduledJob {
 }
 
 impl ScheduledJob {
+    fn is_reboot(&self) -> bool {
+        matches!(&self.timing, ScheduleTiming::Cron { expression, .. } if expression.trim().eq_ignore_ascii_case("@reboot"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn cron(
         name: &str,
@@ -263,7 +267,7 @@ impl ScheduledJob {
     ) -> Result<Self> {
         let parsed = CronSchedule::parse(expression)?;
         let next = if parsed.is_reboot() {
-            now
+            DateTime::<Utc>::MAX_UTC
         } else {
             parsed.next_after(now, timezone)?
         };
@@ -343,7 +347,7 @@ impl ScheduledJob {
             } => {
                 let cron = CronSchedule::parse(expression)?;
                 if cron.is_reboot() {
-                    now
+                    DateTime::<Utc>::MAX_UTC
                 } else {
                     cron.next_after(now, timezone)?
                 }
@@ -452,7 +456,50 @@ impl SchedulerStore {
         if count >= MAX_JOBS as i64 {
             bail!("At most {MAX_JOBS} scheduled jobs are supported");
         }
-        tx.execute("INSERT INTO scheduler_jobs(id,name,enabled,next_run,data) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,enabled=excluded.enabled,next_run=excluded.next_run,data=excluded.data",params![job.id,job.name,job.enabled,job.next_run.timestamp(),serde_json::to_string(job)?])?;
+        let mut job = job.clone();
+        if job.is_reboot() {
+            // An edit can have been opened before the daemon claimed the job.
+            // Preserve both already-consumed and still-pending boot occurrences.
+            let saved: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM scheduler_jobs WHERE id=?1",
+                    [&job.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let previous: Option<ScheduledJob> =
+                saved.as_deref().map(serde_json::from_str).transpose()?;
+            if let Some(old) = previous.filter(ScheduledJob::is_reboot) {
+                job.next_run = old.next_run;
+                job.last_run = old.last_run;
+                job.last_boot_id = old.last_boot_id;
+            } else {
+                job.next_run = DateTime::<Utc>::MAX_UTC;
+                job.last_boot_id = None;
+            }
+        }
+        Self::write_job(&tx, &job)?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn write_job(conn: &Connection, job: &ScheduledJob) -> Result<()> {
+        conn.execute("INSERT INTO scheduler_jobs(id,name,enabled,next_run,data) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET name=excluded.name,enabled=excluded.enabled,next_run=excluded.next_run,data=excluded.data",params![job.id,job.name,job.enabled,job.next_run.timestamp(),serde_json::to_string(job)?])?;
+        Ok(())
+    }
+
+    pub fn queue_now(&mut self, id: &str, now: DateTime<Utc>) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let data: String = tx
+            .query_row("SELECT data FROM scheduler_jobs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .context("Scheduled job is no longer available")?;
+        let mut job: ScheduledJob = serde_json::from_str(&data)?;
+        job.enabled = true;
+        job.next_run = now;
+        Self::write_job(&tx, &job)?;
         tx.commit()?;
         Ok(())
     }
@@ -992,6 +1039,20 @@ where
         entry.stats = json!({"incomplete":true});
         session.entries.push(entry);
     }
+    store.save(&mut session)?;
+    let final_answer = session
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.message.role == "assistant");
+    if error.is_empty() {
+        if let Some(entry) = final_answer.filter(|entry| entry.stats["incomplete"] == true) {
+            error = entry.stats["failure_reason"]
+                .as_str()
+                .unwrap_or("The model stopped before completing its answer")
+                .to_owned();
+        }
+    }
     let state = if cancel.load(Ordering::Relaxed) {
         "cancelled"
     } else if !blocked.is_empty() {
@@ -1009,13 +1070,8 @@ where
             error.push_str(&format!("\n{explanation}"));
         }
     }
-    store.save(&mut session)?;
-    let output = session
-        .entries
-        .iter()
-        .rev()
-        .find(|e| e.message.role == "assistant")
-        .map(|e| e.message.content.as_str())
+    let output = final_answer
+        .map(|entry| entry.message.content.as_str())
         .unwrap_or("");
     scheduler.finish(run, state, Some(&session.id), output, &error, &blocked)?;
     Ok((state.into(), session.id))
@@ -1207,19 +1263,22 @@ fn daemon_identity_matches(status: &DaemonStatus, dir: &Path) -> bool {
         let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", status.pid)) else {
             return false;
         };
-        let args = cmdline
-            .split(|b| *b == 0)
-            .map(|b| String::from_utf8_lossy(b).to_string())
-            .collect::<Vec<_>>();
-        let expected = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        args.iter().any(|a| a == "--daemon")
-            && args.windows(2).any(|a| {
-                a[0] == "--data-dir"
-                    && Path::new(&a[1])
-                        .canonicalize()
-                        .unwrap_or_else(|_| PathBuf::from(&a[1]))
-                        == expected
-            })
+        if !cmdline.split(|b| *b == 0).any(|arg| arg == b"--daemon") {
+            return false;
+        }
+        // The daemon holds this lock for its whole lifetime, including when
+        // it resolved the directory through the environment or XDG defaults.
+        use std::os::unix::fs::MetadataExt;
+        let Ok(lock) = fs::metadata(dir.join("scheduler.lock")) else {
+            return false;
+        };
+        let Ok(descriptors) = fs::read_dir(format!("/proc/{}/fd", status.pid)) else {
+            return false;
+        };
+        descriptors.flatten().any(|fd| {
+            fs::metadata(fd.path())
+                .is_ok_and(|open| open.dev() == lock.dev() && open.ino() == lock.ino())
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1540,6 +1599,48 @@ mod tests {
         assert_eq!(store.observe_boot("boot-2", now).unwrap(), 1);
     }
     #[test]
+    fn editing_a_reboot_job_preserves_pending_and_consumed_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SchedulerStore::open(dir.path()).unwrap();
+        let now = Utc::now();
+        let mut edit = ScheduledJob::cron(
+            "job",
+            "prompt",
+            "model",
+            dir.path().into(),
+            "@reboot",
+            "UTC",
+            now,
+        )
+        .unwrap();
+        store.upsert(&edit).unwrap();
+        store.observe_boot("boot-1", now).unwrap();
+        edit.name = "renamed".into();
+        edit.recalculate(now).unwrap();
+        store.upsert(&edit).unwrap();
+        let run = store.claim_due(now, "worker", 90).unwrap().unwrap();
+        assert_eq!(run.job.name, "renamed");
+        store
+            .finish(&run, "completed", None, "done", "", &[])
+            .unwrap();
+        let later = now + ChronoDuration::minutes(1);
+        edit.prompt = "new prompt".into();
+        edit.recalculate(later).unwrap();
+        store.upsert(&edit).unwrap();
+        assert_eq!(store.observe_boot("boot-1", later).unwrap(), 0);
+        assert!(store.claim_due(later, "worker", 90).unwrap().is_none());
+        assert_eq!(store.observe_boot("boot-2", later).unwrap(), 1);
+        let run = store.claim_due(later, "worker", 90).unwrap().unwrap();
+        assert_eq!(run.job.prompt, "new prompt");
+        store
+            .finish(&run, "completed", None, "done", "", &[])
+            .unwrap();
+        let manual = later + ChronoDuration::minutes(1);
+        store.queue_now(&edit.id, manual).unwrap();
+        assert!(store.claim_due(manual, "worker", 90).unwrap().is_some());
+    }
+
+    #[test]
     fn service_unit_quotes_paths_and_disallows_line_injection() {
         let unit = service_unit(
             Path::new("/tmp/my app/100% tool"),
@@ -1557,6 +1658,15 @@ mod tests {
 
     #[test]
     fn background_action_is_saved_as_needing_approval_not_success() {
+        check_scheduled_tool_exchange(false);
+    }
+
+    #[test]
+    fn scheduled_model_failure_after_read_keeps_partial_output_and_failure_reason() {
+        check_scheduled_tool_exchange(true);
+    }
+
+    fn check_scheduled_tool_exchange(fail_after_read: bool) {
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1638,7 +1748,17 @@ mod tests {
                 } else if path == "/api/chat" {
                     let payload: Value = serde_json::from_slice(&bytes[end..]).unwrap();
                     chat_calls += 1;
-                    if chat_calls == 1 {
+                    if fail_after_read && chat_calls == 1 {
+                        json!({"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"note.txt"}}}]},"done":true})
+                    } else if fail_after_read {
+                        assert!(payload["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m["role"] == "tool"
+                                && m["content"].as_str().unwrap_or("").contains("original")));
+                        json!({"error":"fixture inference failure after read"})
+                    } else if chat_calls == 1 {
                         json!({"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"note.txt","content":"changed"}}}]},"done":true})
                     } else {
                         assert!(payload["messages"]
@@ -1671,7 +1791,11 @@ mod tests {
         let now = Utc::now();
         let mut job = ScheduledJob::cron(
             "edit request",
-            "Change note.txt",
+            if fail_after_read {
+                "Read note.txt and describe its contents"
+            } else {
+                "Change note.txt"
+            },
             "test",
             workspace.path().into(),
             "* * * * *",
@@ -1699,7 +1823,12 @@ mod tests {
         let requests = request_log.lock().unwrap().clone();
         let history = scheduler.history(1).unwrap();
         assert_eq!(
-            state, "needs_approval",
+            state,
+            if fail_after_read {
+                "failed"
+            } else {
+                "needs_approval"
+            },
             "scheduler error: {}; observed API paths: {requests:?}; saved blocked actions: {:?}",
             history[0].error, history[0].blocked_actions
         );
@@ -1708,7 +1837,19 @@ mod tests {
             fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
             "original"
         );
-        assert_eq!(history[0].blocked_actions.len(), 1);
+        if fail_after_read {
+            assert!(
+                history[0]
+                    .error
+                    .contains("fixture inference failure after read"),
+                "{}",
+                history[0].error
+            );
+            assert!(!history[0].output.is_empty());
+            assert!(history[0].blocked_actions.is_empty());
+        } else {
+            assert_eq!(history[0].blocked_actions.len(), 1);
+        }
         assert_eq!(history[0].session_id.as_deref(), Some(session.as_str()));
         assert!(Store::open(dir.path())
             .unwrap()

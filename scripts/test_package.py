@@ -21,7 +21,7 @@ SCRIPTS = ('build.sh', 'clean-build.sh', 'clean.sh', 'check.sh', 'test.sh',
            'rebuild-and-install.sh', 'rebuild-and-run.sh', 'setup.sh')
 
 FAKE_CARGO = r'''#!/usr/bin/env -S python3 -S
-import json, os, pathlib, shutil, sys
+import json, os, pathlib, shutil, sys, tomllib
 args = sys.argv[1:]
 with open(os.environ['FAKE_CARGO_LOG'], 'a') as f:
     f.write(json.dumps({'args': args, 'cwd': os.getcwd(),
@@ -38,7 +38,8 @@ if args and args[0] == 'build':
     profile = 'release' if '--release' in args else 'debug'
     out = pathlib.Path(os.environ['CARGO_TARGET_DIR']) / profile / 'ollama-workbench'
     out.parent.mkdir(parents=True, exist_ok=True)
-    identity = '0.0.0-STALE' if os.environ.get('FAKE_STALE_IDENTITY') else '0.4.0-rc.8'
+    version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+    identity = '0.0.0-STALE' if os.environ.get('FAKE_STALE_IDENTITY') else version
     out.write_text('#!/usr/bin/env -S python3 -S\n'
                    'import json, sys\n'
                    'if sys.argv[1:] == ["--version"]:\n'
@@ -103,6 +104,26 @@ class LaunchAndInstall(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
         return path
+
+    def test_setup_installs_zstd_before_installing_local_ollama(self):
+        # Exercise setup even on hosts that already have Ollama or run as root.
+        for name in ('bash', 'dirname', 'uname', 'sort', 'head', 'awk'):
+            (self.tools / name).symlink_to(shutil.which(name))
+        for name in ('apt-get', 'rustup'):
+            (self.tools / name).symlink_to(shutil.which('true'))
+        (self.tools / 'id').write_text('#!/bin/sh\necho 1000\n')
+        (self.tools / 'id').chmod(0o755)
+        self.env['PATH'] = str(self.tools)
+        self.assertFalse((self.home / '.cargo/env').exists())
+        flags = ('--dry-run', '--no-optional', '--no-install')
+        local = self.command('setup.sh', '--ollama', *flags)
+        self.assertEqual(local.returncode, 0, local.stderr)
+        install_zstd = 'apt-get install -y --no-install-recommends zstd'
+        self.assertLess(local.stdout.index(install_zstd),
+                        local.stdout.index('https://ollama.com/install.sh'))
+        remote = self.command('setup.sh', '--no-ollama', *flags)
+        self.assertEqual(remote.returncode, 0, remote.stderr)
+        self.assertNotIn(install_zstd, remote.stdout)
 
     def test_release_build_is_locked_and_does_not_clean_or_install(self):
         old = self.old_binary()
@@ -421,10 +442,11 @@ class SourceIntegrity(unittest.TestCase):
 
     def test_rc8_mcp_web_search_sources_are_packaged(self):
         manifest = tomllib.loads((ROOT / 'Cargo.toml').read_text())
-        self.assertEqual(manifest['package']['version'], '0.4.0-rc.8')
+        version = manifest['package']['version']
+        self.assertIn(f'Version {version} ', (ROOT / 'README.md').read_text())
         lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
         own = next(entry for entry in lock['package'] if entry['name'] == 'ollama-workbench')
-        self.assertEqual(own['version'], '0.4.0-rc.8')
+        self.assertEqual(own['version'], version)
 
         mcp = (ROOT / 'src/services/mcp.rs').read_text()
         tools = (ROOT / 'src/workspace/tools/mod.rs').read_text()

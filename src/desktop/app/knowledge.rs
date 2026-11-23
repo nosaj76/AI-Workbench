@@ -42,7 +42,9 @@ impl Workbench {
         });
         ui.horizontal(|ui| {
             ui.label("Embedding model");
-            ui.text_edit_singleline(&mut self.settings.embedding_model);
+            if ui.text_edit_singleline(&mut self.settings.embedding_model).changed() {
+                self.save_preferences();
+            }
         });
         ui.label(RichText::new("Text retrieval uses SQLite FTS5. Embedding retrieval combines lexical matches and cosine similarity; vectors stay in the local index.").small());
         ui.separator();

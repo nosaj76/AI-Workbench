@@ -32,6 +32,98 @@ fn message_cost(m: &ChatMessage) -> usize {
         + 64
 }
 
+/// Keep full schemas when they fit. For a small context, keep valid parameter schemas
+/// and prioritize the requested operations while leaving space for their results.
+pub(super) fn fit_tool_definitions(
+    definitions: &mut Vec<Value>,
+    messages: &[ChatMessage],
+    user: &str,
+    needs_web_search: bool,
+    num_ctx: u32,
+    num_predict: i32,
+) -> Result<()> {
+    if definitions.is_empty() {
+        return Ok(());
+    }
+    let instruction_cost: usize = messages
+        .iter()
+        .filter(|m| m.role == "system" && project_hint(m).is_none())
+        .map(message_cost)
+        .sum();
+    let user_cost = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map_or(0, message_cost);
+    let room = request_budget(num_ctx, num_predict, 0).saturating_sub(instruction_cost + user_cost);
+    if serde_json::to_string(definitions)?.chars().count() <= room.saturating_sub(700) {
+        return Ok(());
+    }
+    let lower = user.to_ascii_lowercase();
+    let words: std::collections::HashSet<_> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let editing = ["edit", "fix", "change", "modify", "update"]
+        .iter()
+        .any(|word| words.contains(word));
+    let creating = ["create", "build", "implement", "generate"]
+        .iter()
+        .any(|word| words.contains(word));
+    let priority = |d: &Value| {
+        let name = d["function"]["name"].as_str().unwrap_or("");
+        let verb = name.split('_').next().unwrap_or(name);
+        if needs_web_search && name == "web_search" {
+            0
+        } else if words.contains(verb)
+            || (editing && matches!(name, "read_file" | "replace_text"))
+            || (creating && name == "write_file")
+            || matches!(name, "terminal_open" | "terminal_read" | "terminal_write")
+        {
+            // Terminal schemas only survive turn-level scoping for terminal work.
+            1
+        } else if name == "read_file" {
+            2
+        } else if matches!(name, "search_files" | "list_files" | "fetch_url") {
+            3
+        } else {
+            4
+        }
+    };
+    definitions.sort_by_key(priority);
+    let limit = room.saturating_sub((room / 2).min(1_500));
+    let mut used = 2;
+    let mut kept = Vec::new();
+    for mut definition in definitions.drain(..) {
+        let function = &mut definition["function"];
+        if let Some(description) = function["description"].as_str() {
+            let short = description
+                .split_once(". ")
+                .map_or(description, |(first, _)| first);
+            function["description"] = Value::String(short.to_owned());
+        }
+        if let Some(properties) = function["parameters"]["properties"].as_object_mut() {
+            for schema in properties.values_mut().filter_map(Value::as_object_mut) {
+                schema.remove("description");
+            }
+        }
+        let required = needs_web_search && function["name"] == "web_search";
+        let cost = serde_json::to_string(&definition)?.chars().count() + 1;
+        if required && used + cost > room {
+            bail!("The current request leaves too little context for web search. Narrow the request or raise the context size.");
+        }
+        if used + cost <= limit || (kept.is_empty() && used + cost <= room) {
+            kept.push(definition);
+            used += cost;
+        }
+    }
+    if kept.is_empty() {
+        bail!("The current request leaves too little context for an enabled tool. Narrow the request or raise the context size.");
+    }
+    *definitions = kept;
+    Ok(())
+}
+
 pub(super) fn fit_context_reserved(
     messages: &[ChatMessage],
     num_ctx: u32,

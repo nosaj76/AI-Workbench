@@ -2,6 +2,12 @@
 use super::*;
 use crate::notes::{NoteStore, NoteSummary};
 
+pub(super) struct NoteDraft {
+    slug: String,
+    original: String,
+    text: String,
+}
+
 impl AdvancedUi {
     pub(super) fn reload_notes(&mut self) {
         let result = NoteStore::open(&self.dir).and_then(|store| {
@@ -157,14 +163,14 @@ impl AdvancedUi {
             match NoteStore::open(&self.dir)
                 .and_then(|s| std::fs::read_to_string(s.path(&slug)).map_err(Into::into))
             {
-                Ok(text) => self.note_open = Some((slug, text)),
+                Ok(text) => self.note_open = Some(NoteDraft { slug, original: text.clone(), text }),
                 Err(e) => self.error = Some(e.to_string()),
             }
         }
         if let Some(slug) = delete {
             match NoteStore::open(&self.dir).and_then(|s| s.delete(&slug)) {
                 Ok(_) => {
-                    if self.note_open.as_ref().is_some_and(|(s, _)| *s == slug) {
+                    if self.note_open.as_ref().is_some_and(|draft| draft.slug == slug) {
                         self.note_open = None;
                     }
                     self.reload_notes();
@@ -173,7 +179,7 @@ impl AdvancedUi {
             }
             ui.small("Deleted notes are kept in the notes folder under .deleted.");
         }
-        if let Some((slug, text)) = &mut self.note_open {
+        if let Some(NoteDraft { slug, original, text }) = &mut self.note_open {
             ui.separator();
             ui.strong(format!("{slug}.md (plain Markdown; edit and save)"));
             egui::ScrollArea::vertical()
@@ -192,14 +198,12 @@ impl AdvancedUi {
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
                     let write = NoteStore::open(&self.dir)
-                        .map(|s| (std::fs::write(s.path(slug), text.as_bytes()), s))
-                        .and_then(|(r, s)| {
-                            r?;
-                            s.sync()?;
-                            Ok(())
-                        });
+                        .and_then(|store| store.save_edit(slug, original, text));
                     match write {
-                        Ok(()) => saved = true,
+                        Ok(()) => {
+                            original.clone_from(text);
+                            saved = true;
+                        }
                         Err(e) => self.error = Some(e.to_string()),
                     }
                 }

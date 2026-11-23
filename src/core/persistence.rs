@@ -9,6 +9,21 @@ use std::{
     path::Path,
 };
 
+/// Cooperating writers hold the returned file through the entire read/modify/write.
+pub fn lock_file(path: &Path) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
 pub fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> {
     let file = fs::File::open(path).with_context(|| format!("Read {}", path.display()))?;
     let mut bytes = Vec::new();
@@ -30,6 +45,14 @@ pub fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
 }
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with(path, |file| Ok(file.write_all(bytes)?))
+}
+
+/// Commit a streamed file only after serialization and validation both succeed.
+pub(crate) fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -49,7 +72,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
+        write(&mut file)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;

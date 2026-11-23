@@ -50,24 +50,7 @@ pub fn default_source_root() -> Option<PathBuf> {
 /// The most recently updated conversations that contain at least one answer,
 /// newest first. Trashed conversations are excluded; archived ones are kept.
 pub fn recent_sessions(store: &Store, count: usize) -> Result<Vec<Session>> {
-    let mut summaries = store.list("", true)?;
-    // The list puts pinned chats first; a review wants recency.
-    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    let mut sessions = Vec::new();
-    for summary in summaries {
-        if sessions.len() >= count {
-            break;
-        }
-        let session = store.load(&summary.id)?;
-        if session
-            .entries
-            .iter()
-            .any(|entry| entry.message.role == "assistant")
-        {
-            sessions.push(session);
-        }
-    }
-    Ok(sessions)
+    store.recent_answered(count)
 }
 
 fn clip(text: &str, max: usize) -> String {

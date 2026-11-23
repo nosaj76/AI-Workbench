@@ -293,23 +293,79 @@ pub(super) fn review_coverage_footer(
     footer
 }
 
-pub(super) fn explicitly_requests_web_search(text: &str) -> bool {
+pub(super) fn web_access_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "web_search"
+            | "fetch_url"
+            | "qa_lookup"
+            | "consult_agent"
+            | "mcp_call"
+            | "mcp_read"
+            | "mcp_prompt"
+            | "mcp_connect"
+    )
+}
+
+pub(super) fn completion_stats(mut stats: Value, options: &ChatOptions) -> Value {
+    if stats.get("done_reason").and_then(Value::as_str) != Some("length") {
+        return stats;
+    }
+    let prompt_tokens = stats["prompt_eval_count"].as_u64().unwrap_or(0);
+    let used = prompt_tokens.saturating_add(stats["eval_count"].as_u64().unwrap_or(0));
+    let reason = if options.num_predict <= 0
+        || used.saturating_add(64) >= u64::from(options.num_ctx)
+    {
+        format!(
+            "This reply stopped because the context window ({} tokens) is full: the conversation so far used {} and the reply the rest. It is not finished. Start a new chat, or raise Context tokens in Settings, then reply \"continue\".",
+            options.num_ctx, prompt_tokens
+        )
+    } else {
+        format!(
+            "This reply stopped at the output token limit ({}), not because it was finished. Reply \"continue\" to get the rest, or raise Output token limit in Settings.",
+            options.num_predict
+        )
+    };
+    stats["incomplete"] = Value::Bool(true);
+    stats["interruption_kind"] = Value::String("output_limit".into());
+    stats["failure_reason"] = Value::String(reason);
+    stats
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WebSearchIntent {
+    Requested,
+    Unspecified,
+    Prohibited,
+}
+
+pub(super) fn web_search_intent(text: &str) -> WebSearchIntent {
     let user = crate::memory::user_text(text);
-    let lower = user.trim().to_ascii_lowercase();
+    let lower = user.trim().to_ascii_lowercase().replace('’', "'");
     if [
-        "do not search",
-        "don't search",
-        "dont search",
+        "do not search the web",
+        "don't search the web",
+        "dont search the web",
+        "do not search online",
+        "don't search online",
+        "do not search the internet",
+        "don't search the internet",
         "without web search",
         "no web search",
         "offline only",
         "do not browse",
         "don't browse",
+        "without searching the web",
+        "do not use the web",
+        "do not use web search",
+        "don't use web search",
+        "without internet",
+        "no internet",
     ]
     .iter()
     .any(|phrase| lower.contains(phrase))
     {
-        return false;
+        return WebSearchIntent::Prohibited;
     }
     let command = lower.as_str();
     let command = ["please ", "can you ", "could you ", "would you "]
@@ -317,7 +373,7 @@ pub(super) fn explicitly_requests_web_search(text: &str) -> bool {
         .find_map(|prefix| command.strip_prefix(*prefix))
         .unwrap_or(command);
     let command = command.strip_prefix("please ").unwrap_or(command);
-    [
+    let requested = [
         "search the web",
         "search online",
         "search the internet",
@@ -335,7 +391,12 @@ pub(super) fn explicitly_requests_web_search(text: &str) -> bool {
                 .next()
                 .is_none_or(|ch| ch.is_whitespace() || matches!(ch, ':' | '?'))
         })
-    })
+    });
+    if requested {
+        WebSearchIntent::Requested
+    } else {
+        WebSearchIntent::Unspecified
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -918,7 +979,7 @@ pub(super) fn incomplete_review_report(
         .iter()
         .rev()
         .find(|message| message.role == "user")
-        .is_some_and(|message| explicitly_requests_web_search(&message.content))
+        .is_some_and(|message| web_search_intent(&message.content) == WebSearchIntent::Requested)
     {
         return format!(
             "## Web search incomplete\n\n{reason}\n\nWorkbench recorded {result_count} successful tool result(s), {failures} denied/failed result(s), and {skipped} skipped request(s) in this turn. This is an application status report, not a researched answer.\n\nInspect the web_search/fetch_url results above for provider errors or returned sources. A local directory listing is not a web search. Search requires Tools, network access, and an enabled configured provider; these settings are not enabled automatically."

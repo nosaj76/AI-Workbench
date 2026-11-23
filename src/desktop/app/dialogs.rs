@@ -194,7 +194,7 @@ impl Workbench {
                         original.skill_name = self.settings.skill_name.clone();
                         original.skill_prompt = self.settings.skill_prompt.clone();
                     }
-                    self.persist();
+                    self.save_preferences();
                 }
             }
         }

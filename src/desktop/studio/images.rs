@@ -210,26 +210,26 @@ impl StudioUi {
         ui.label(RichText::new("Image engines and weights must already be installed. Current Ollama builds may reject image-generation models; this panel uses the selected diffusion engine's supported interface.").small());
     }
 
-    pub(super) fn image_job(&mut self, workspace: Option<&Path>) -> Result<StudioJob> {
-        self.config.image.sd_extra_args = serde_json::from_str(&self.extra_args_json)
-            .context("Additional arguments must be a JSON array of strings")?;
+    pub(super) fn image_job(&self, workspace: Option<&Path>) -> Result<StudioJob> {
+        let mut config = self.config.image.clone();
         let mut request = self.image.clone();
-        request.input_image = if self.image_input.trim().is_empty() {
-            None
+        request.input_image = None;
+        request.workflow = None;
+        if config.backend == ImageBackend::StableDiffusionCpp {
+            config.sd_extra_args = serde_json::from_str(&self.extra_args_json)
+                .context("Additional arguments must be a JSON array of strings")?;
         } else {
-            Some(input_path(&self.image_input, workspace)?)
-        };
-        request.workflow = if self.workflow_json.trim().is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str(&self.workflow_json)
-                    .context("Custom workflow must be valid API JSON")?,
-            )
-        };
-        Ok(StudioJob::Image(Box::new((
-            self.config.image.clone(),
-            request,
-        ))))
+            config.sd_extra_args.clear();
+            if !self.image_input.trim().is_empty() {
+                request.input_image = Some(input_path(&self.image_input, workspace)?);
+            }
+            if config.backend == ImageBackend::ComfyUi && !self.workflow_json.trim().is_empty() {
+                request.workflow = Some(
+                    serde_json::from_str(&self.workflow_json)
+                        .context("Custom workflow must be valid API JSON")?,
+                );
+            }
+        }
+        Ok(StudioJob::Image(Box::new((config, request))))
     }
 }

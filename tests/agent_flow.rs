@@ -37,6 +37,13 @@ impl MockOllama {
     }
 
     fn with_metadata(responses: Vec<Value>, metadata: Value) -> Self {
+        Self::with_tags(responses, metadata, &["test"])
+    }
+
+    fn with_tags(responses: Vec<Value>, metadata: Value, tags: &[&str]) -> Self {
+        let listed = json!({"models":tags.iter().map(|name| {
+            json!({"name":name,"size":1_000_000,"details":{"family":"test"}})
+        }).collect::<Vec<_>>()});
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -72,10 +79,15 @@ impl MockOllama {
                         .pop_front()
                         .unwrap_or_else(|| json!({"error":"Unexpected extra inference request"})),
                     "/api/show" => metadata.clone(),
-                    "/api/tags" => json!({"models":[{"name":"test","details":{"family":"test"}}]}),
+                    "/api/tags" => listed.clone(),
                     path if path.starts_with("/search?") => {
                         if path.contains("provider-failure") {
                             json!({"error":"synthetic search provider failure"})
+                        } else if path.contains("loopback-fixture") {
+                            json!({"results":[{
+                                "title":"Local fixture", "url":"https://127.0.0.1/ai",
+                                "content":"A result for the URL scoping test."
+                            }]})
                         } else if path.contains("kernel-notes") {
                             json!({"results":[{
                                 "title":"Kernel configuration", "url":"https://example.invalid/kernel",
@@ -1096,6 +1108,89 @@ fn web_job(server: &MockOllama, root: &Path) -> ChatJob {
 }
 
 #[test]
+fn offline_code_request_keeps_local_answer_and_blocks_provider_calls() {
+    for unsolicited_call in [false, true] {
+        let (_directory, root) = fixture();
+        let mut replies = vec![];
+        if unsolicited_call {
+            replies.push(call("web_search", json!({"query":"sort example"})));
+        }
+        replies.push(final_answer("def ordered(values): return sorted(values)"));
+        let server = MockOllama::new(replies);
+        let mut task = web_job(&server, &root);
+        task.settings.auto_approve_web = true;
+        task.messages = vec![message(
+            "user",
+            "Write a Python function to sort a list. Do not search the web.",
+        )];
+        let transcript = run(task, |_| Decision::Approve);
+        assert!(transcript.errors.is_empty(), "{:?}", transcript.errors);
+        assert!(transcript.approvals.is_empty());
+        assert_eq!(
+            transcript.complete.last().unwrap().content,
+            "def ordered(values): return sorted(values)"
+        );
+        assert!(!server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.starts_with("/search")));
+        for chat in server.chats() {
+            assert!(chat["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["function"]["name"] != "web_search"));
+            assert!(!chat["messages"]
+                .to_string()
+                .contains("Before writing any code, call web_search"));
+        }
+        if unsolicited_call {
+            let result: Value = serde_json::from_str(&transcript.tools[0].content).unwrap();
+            assert_eq!(result["denied"], true);
+            assert_eq!(result["executed"], false);
+        }
+    }
+}
+
+#[test]
+fn lower_memory_preset_reads_workspace_file_with_the_full_default_system_prompt() {
+    let (_directory, root) = fixture();
+    std::fs::write(root.join("README.md"), "Workshop line 42.").unwrap();
+    let server = MockOllama::new(vec![
+        call("read_file", json!({"path":"README.md"})),
+        final_answer("Workshop line 42."),
+    ]);
+    let mut task = job(&server, &root, vec![]);
+    task.settings.agents_enabled = true;
+    task.settings.num_ctx = 4096;
+    task.settings.num_predict = -1;
+    task.engine = None;
+    task.messages = vec![
+        message("system", &task.settings.system()),
+        message("user", "Read README.md"),
+    ];
+    let transcript = run(task, |_| panic!("Reading a file is read-only"));
+    assert!(transcript.errors.is_empty(), "{:?}", transcript.errors);
+    assert_eq!(
+        transcript.complete.last().unwrap().content,
+        "Workshop line 42."
+    );
+    let chats = server.chats();
+    assert_eq!(chats.len(), 2);
+    assert!(chats[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["function"]["name"] == "read_file"));
+    assert_eq!(chats[0]["options"]["num_ctx"], 4096);
+    assert!(chats[1]["messages"].as_array().unwrap().iter().any(
+        |m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("Workshop line 42.")
+    ));
+}
+
+#[test]
 fn explicit_web_search_missing_configuration_never_runs_local_tools_or_inference() {
     let (_directory, root) = fixture();
     let server = MockOllama::new(vec![]);
@@ -1481,14 +1576,22 @@ fn project_file_paths_are_given_to_the_model_up_front() {
 fn web_search_turn_only_fetches_urls_from_results_or_the_user() {
     let (_directory, root) = fixture();
     let server = MockOllama::new(vec![
-        call("web_search", json!({"query":"ai"})),
+        call("web_search", json!({"query":"loopback-fixture"})),
         // Guessed from memory: must not reach approval or the network.
         call("fetch_url", json!({"url":"https://guessed.example/page"})),
         // Listed in the search result (with cosmetic differences).
-        call("fetch_url", json!({"url":"http://www.example.invalid/ai/"})),
+        call("fetch_url", json!({"url":"http://127.0.0.1/ai/"})),
         final_answer("Done."),
     ]);
-    let transcript = run(web_job(&server, &root), |_| Decision::Approve);
+    let transcript = run(web_job(&server, &root), |action| {
+        // Getting as far as approval proves the returned URL was accepted.
+        // Do not send a real request to the fixture URL.
+        if action.details["url"].as_str().is_some() {
+            Decision::Deny
+        } else {
+            Decision::Approve
+        }
+    });
     let titles: Vec<&str> = transcript
         .approvals
         .iter()
@@ -1498,7 +1601,7 @@ fn web_search_turn_only_fetches_urls_from_results_or_the_user() {
     assert!(transcript.approvals[1]
         .details
         .to_string()
-        .contains("example.invalid/ai"));
+        .contains("127.0.0.1/ai"));
     assert!(!transcript
         .approvals
         .iter()
@@ -1509,7 +1612,7 @@ fn web_search_turn_only_fetches_urls_from_results_or_the_user() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|u| u == "example.invalid/ai"));
+        .any(|u| u == "127.0.0.1/ai"));
 }
 
 #[cfg(unix)]
@@ -2401,7 +2504,11 @@ fn a_long_partial_reply_is_continued_from_its_end_without_losing_the_request() {
 #[test]
 fn routing_keeps_the_model_that_answered_the_conversation_before() {
     let (_directory, root) = fixture();
-    let server = MockOllama::new(vec![final_answer("Same voice as before.")]);
+    let server = MockOllama::with_tags(
+        vec![final_answer("Same voice as before.")],
+        json!({"capabilities":["completion","tools"]}),
+        &["test", "earlier-model"],
+    );
     let mut request = job(&server, &root, vec![message("user", "expand on that idea")]);
     request.settings.model_routing = true;
     request.settings.conversation_model = Some("earlier-model".into());
@@ -2412,7 +2519,7 @@ fn routing_keeps_the_model_that_answered_the_conversation_before() {
         transcript
             .statuses
             .iter()
-            .any(|s| s.starts_with("Keeping earlier-model for this conversation")),
+            .any(|s| s.contains("Keeping earlier-model for this conversation")),
         "{:?}",
         transcript.statuses
     );

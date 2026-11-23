@@ -232,7 +232,25 @@ impl Settings {
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
-        crate::persistence::write_json(&dir.join("settings.json"), self)
+        self.write_preferences(dir, false)
+    }
+
+    /// The explicit Settings recovery action is the only writer allowed to
+    /// replace an unreadable settings file, and only after preserving its bytes.
+    pub(crate) fn save_after_recovery(&self, dir: &Path) -> Result<()> {
+        self.write_preferences(dir, true)
+    }
+
+    fn write_preferences(&self, dir: &Path, recover: bool) -> Result<()> {
+        let _lock = crate::persistence::lock_file(&dir.join("settings.lock"))?;
+        let path = dir.join("settings.json");
+        if let Err(error) = Self::load(dir) {
+            if !recover {
+                return Err(error);
+            }
+            crate::persistence::backup_existing(&path)?;
+        }
+        crate::persistence::write_json(&path, self)
     }
 
     pub fn validate_endpoint(&self) -> Result<()> {
@@ -556,5 +574,34 @@ mod tests {
         settings.save(dir.path()).unwrap();
         assert!(!Settings::load(dir.path()).unwrap().dark_mode);
         assert_eq!(Settings::load(dir.path()).unwrap().model, "local:7b");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn shortcuts_preserve_corrupt_bytes_until_explicit_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = b"{ partial settings";
+        std::fs::write(&path, original).unwrap();
+        let defaults = Settings::default();
+        assert!(defaults.save(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        defaults.save_after_recovery(dir.path()).unwrap();
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.recovery-")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(backup.path()).unwrap(), original);
+        assert!(Settings::load(dir.path()).is_ok());
     }
 }

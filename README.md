@@ -6,7 +6,7 @@ web, run approved commands and terminals, schedule jobs, and generate documents
 and media — with nothing leaving your computer unless you allow it.
 
 It is a Rust/egui desktop program, not a website, and needs no browser.
-Version 0.4.0-rc.8 (release candidate). MIT licensed.
+Version 0.4.0-rc.9 (release candidate). MIT licensed.
 
 > The executable and data folder are still called `ollama-workbench`, so
 > existing installs keep their conversations and settings.
@@ -176,6 +176,11 @@ Data lives in `~/.local/share/ollama-workbench` (or `$XDG_DATA_HOME`). Override 
 with `--data-dir PATH` or `OLLAMA_WORKBENCH_DATA_DIR`. Back it up with the app
 closed. It holds conversations (SQLite), settings, saved file versions, knowledge
 notes, the Q&A library and `crash-reports/`.
+
+Individual conversations can also be exported and restored as JSON. Import and
+export support up to 256 MiB and 100,000 messages per conversation. Image
+attachments count toward the file size. Use a full data-directory backup for
+larger conversations.
 
 If the app crashes, the next start says so and points to the report. Nothing is
 sent anywhere.

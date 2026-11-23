@@ -33,6 +33,81 @@ const HARDENING: [&str; 15] = [
     "--literal-pathspecs",
 ];
 
+// Compute the actual prospective tree in a disposable index and object store.
+// Git supplies the same pathspec, attributes, mode and ignore semantics as the
+// final commit. Even an unborn branch can be previewed without writing .git.
+const SNAPSHOT_ALIAS: &str = r#"alias.workbench-preview=!f() {
+    set -eu
+    scratch=$(mktemp -d)
+    trap 'rm -rf -- "$scratch"' EXIT
+    # Indexing may run a user/system clean filter even when .git/config is
+    # clean. It must never run a helper merely to show an approval prompt.
+    if git config --get-regexp '^filter\..*\.(clean|process)$' >/dev/null; then
+        git ls-files --cached --others --exclude-standard -- "$@" > "$scratch/paths"
+        git check-attr --stdin filter < "$scratch/paths" > "$scratch/attributes"
+        sed 's/^.*: filter: //' "$scratch/attributes" | sort -u > "$scratch/filters"
+        while IFS= read -r name; do
+            case "$name" in unspecified|unset|'') continue ;; esac
+            for field in clean process; do
+                helper=$(git config --get "filter.$name.$field") || helper=
+                if [ -n "$helper" ]; then
+                    echo "A selected file uses a Git clean filter. Commit it manually or select other paths." >&2
+                    exit 1
+                fi
+            done
+        done < "$scratch/filters"
+    fi
+    head=$(git rev-parse --verify -q HEAD) || head=
+    ref=$(git symbolic-ref -q HEAD) || ref=HEAD
+    index=$(git rev-parse --path-format=absolute --git-path index)
+    objects=$(git rev-parse --path-format=absolute --git-path objects)
+    mkdir "$scratch/objects"
+    export GIT_INDEX_FILE="$scratch/index" GIT_OBJECT_DIRECTORY="$scratch/objects"
+    export GIT_ALTERNATE_OBJECT_DIRECTORIES="$objects${GIT_ALTERNATE_OBJECT_DIRECTORIES:+:$GIT_ALTERNATE_OBJECT_DIRECTORIES}"
+    if [ "$#" -eq 0 ]; then
+        if [ -f "$index" ]; then cp -- "$index" "$GIT_INDEX_FILE"; fi
+        git add --all -- .
+    else
+        if [ -n "$head" ]; then git read-tree "$head"; else git read-tree --empty; fi
+        git add --all -- "$@"
+    fi
+    tree=$(git write-tree)
+    printf '%s\n' "$head" "$ref" "$tree"
+    git diff --cached --no-color --no-ext-diff --no-textconv --stat --patch
+}; f"#;
+
+// This is the only hook in a fresh private directory: repository/user hooks
+// remain disabled. Git invokes it on the *actual locked commit index*, after
+// --only has assembled its tree, before publishing any commit.
+const VERIFY_COMMIT: &str = r#"#!/bin/sh
+set -eu
+dir=${0%/*}
+head=$(git rev-parse --verify -q HEAD) || head=
+ref=$(git symbolic-ref -q HEAD) || ref=HEAD
+if [ "$head" != "$(cat "$dir/head")" ] || [ "$ref" != "$(cat "$dir/ref")" ] ||
+   [ "$(git write-tree)" != "$(cat "$dir/tree")" ]; then
+    echo 'The Git branch, HEAD or proposed contents changed. Request a new commit preview.' >&2
+    exit 1
+fi
+"#;
+
+/// Other Git processes use this same lock for staging, reset and checkout.
+struct GitIndexLock(PathBuf);
+
+impl GitIndexLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        OpenOptions::new().write(true).create_new(true).open(&path)
+            .context("Could not lock the Git index; finish the other Git operation and retry")?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for GitIndexLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 pub(super) fn definitions() -> Vec<Value> {
     let path = || json!({"type":"string"});
     vec![
@@ -70,10 +145,18 @@ impl ToolEngine {
     }
 
     fn git(&self, args: &[&str], read_only: bool) -> Result<integrations::CommandResult> {
+        self.git_in_index(args, read_only, None)
+    }
+
+    fn git_in_index(&self, args: &[&str], read_only: bool, index: Option<&Path>)
+        -> Result<integrations::CommandResult> {
         if !self.is_git_repository() {
             bail!("The project folder is not a git repository");
         }
         let mut env = BTreeMap::new();
+        if let Some(index) = index {
+            env.insert("GIT_INDEX_FILE".into(), index.to_str().context("Git index path is not UTF-8")?.into());
+        }
         env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
         env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
         env.insert("GIT_PAGER".into(), "cat".into());
@@ -100,6 +183,10 @@ impl ToolEngine {
 
     fn git_ok(&self, args: &[&str], read_only: bool) -> Result<String> {
         let result = self.git(args, read_only)?;
+        Self::git_output(args, result)
+    }
+
+    fn git_output(args: &[&str], result: integrations::CommandResult) -> Result<String> {
         if result.exit_code != Some(0) {
             bail!(
                 "git {} failed: {}",
@@ -194,7 +281,27 @@ impl ToolEngine {
             ],
             true,
         )?;
-        Ok(result.stdout.lines().map(str::to_owned).collect())
+        if result.exit_code == Some(1) {
+            return Ok(Vec::new());
+        }
+        let config = Self::git_output(&["config"], result)?;
+        Ok(config.lines().map(str::to_owned).collect())
+    }
+
+    fn prospective_commit(&self, paths: &[String]) -> Result<(GitCommitSnapshot, String)> {
+        let mut command = vec!["-c", "core.splitIndex=false", "-c", SNAPSHOT_ALIAS, "workbench-preview"];
+        command.extend(paths.iter().map(String::as_str));
+        let output = self.git_ok(&command, true)?;
+        let mut fields = output.splitn(4, '\n');
+        let head = fields.next().unwrap_or_default().to_owned();
+        let head_ref = fields.next().context("Missing preview branch")?.to_owned();
+        let tree = fields.next().context("Missing preview tree")?.to_owned();
+        if head_ref.is_empty() || !matches!(tree.len(), 40 | 64)
+            || !tree.bytes().all(|c| c.is_ascii_hexdigit()) {
+            bail!("Git returned an incomplete commit preview");
+        }
+        let diff = fields.next().unwrap_or_default().chars().take(MAX_DIFF_CHARS).collect();
+        Ok((GitCommitSnapshot { head, head_ref, tree }, diff))
     }
 
     pub(super) fn prepare_git_commit(
@@ -230,25 +337,7 @@ impl ToolEngine {
         if status["clean"] == true {
             bail!("There is nothing to commit");
         }
-        // Preview: everything that would be staged, against HEAD.
-        let mut preview = vec![
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "HEAD",
-            "--stat",
-            "--patch",
-        ];
-        if !paths.is_empty() {
-            preview.push("--");
-            preview.extend(paths.iter().map(String::as_str));
-        }
-        let diff = self
-            .git(&preview, true)
-            .map(|r| r.stdout)
-            .unwrap_or_default();
-        let diff: String = diff.chars().take(MAX_DIFF_CHARS).collect();
+        let (snapshot, diff) = self.prospective_commit(&paths)?;
         let details = json!({
             "message": message,
             "branch": branch,
@@ -264,7 +353,7 @@ impl ToolEngine {
             },
             "Stage the listed changes and create a git commit. Hooks and signing are disabled; the commit can be undone with git reset.".into(),
             details,
-            Operation::GitCommit { message, paths, branch },
+            Operation::GitCommit { message, paths, branch, snapshot },
         ))
     }
 
@@ -273,58 +362,108 @@ impl ToolEngine {
         message: &str,
         paths: &[String],
         branch: Option<&str>,
+        snapshot: &GitCommitSnapshot,
     ) -> Result<Value> {
         if !self.configured_filter_programs()?.is_empty() {
             bail!(
                 "The repository configured filter programs after the preview; nothing was staged"
             );
         }
-        if let Some(branch) = branch {
-            self.git_ok(&["switch", "--create", branch], false)?;
+        if self.prospective_commit(paths)?.0 != *snapshot {
+            bail!("The Git branch, HEAD or proposed contents changed. Request a new commit preview.");
         }
-        let mut commit = vec!["commit", "--no-verify", "--quiet", "-m", message];
+        let index_path = self.git_ok(&["rev-parse","--path-format=absolute","--git-path","index"], true)?;
+        let index = PathBuf::from(index_path.trim_end_matches('\n'));
+        let mut lock_path = index.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let _index_lock = GitIndexLock::acquire(lock_path)?;
+        let directory = tempfile::tempdir_in(index.parent().context("Missing Git index directory")?)?;
+        let shadow = directory.path().join("index");
+        if index.try_exists()? {
+            fs::copy(&index, &shadow)?;
+        }
+        // Every staging operation and Git's commit use this private index. Failed
+        // approvals leave the user's real index and unrelated staged work intact.
+        let run = |args: &[&str]| -> Result<String> {
+            Self::git_output(args, self.git_in_index(args, false, Some(&shadow))?)
+        };
+        fs::write(directory.path().join("head"), &snapshot.head)?;
+        fs::write(directory.path().join("tree"), &snapshot.tree)?;
+        let expected_ref = branch.map(|b| format!("refs/heads/{b}"))
+            .unwrap_or_else(|| snapshot.head_ref.clone());
+        fs::write(directory.path().join("ref"), &expected_ref)?;
+        let hook = directory.path().join("pre-commit");
+        fs::write(&hook, VERIFY_COMMIT)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+        }
+        let guard_config = format!("core.hooksPath={}", directory.path().display());
+        let mut commit = vec!["-c", &guard_config, "commit", "--quiet", "-m", message];
         if paths.is_empty() {
-            self.git_ok(&["add", "--all", "--", "."], false)?;
+            run(&["add", "--all", "--", "."])?;
         } else {
-            // A path-limited commit already takes tracked content from the worktree.
-            // Register new paths, skipping deletions that may already be staged.
-            let mut existing = Vec::new();
+            let mut register = vec!["add", "--intent-to-add", "--"];
             for path in paths {
                 if self.workspace.resolve(path, true)?.try_exists()? {
-                    existing.push(path.as_str());
+                    register.push(path);
                 }
             }
-            let mut registered = Vec::new();
-            if !existing.is_empty() {
-                let indexed = |engine: &Self| -> Result<std::collections::BTreeSet<String>> {
-                    let mut args = vec!["ls-files", "--cached", "-z", "--"];
-                    args.extend(&existing);
-                    let out = engine.git_ok(&args, true)?;
-                    Ok(out.split('\0').filter(|p| !p.is_empty()).map(str::to_owned).collect())
-                };
-                let before = indexed(self)?;
-                let mut add = vec!["add", "--intent-to-add", "--"];
-                add.extend(&existing);
-                self.git_ok(&add, false)?;
-                registered = indexed(self)?.difference(&before).cloned().collect();
+            if register.len() > 3 {
+                run(&register)?;
             }
             commit.extend(["--only", "--"]);
             commit.extend(paths.iter().map(String::as_str));
-            if let Err(error) = self.git_ok(&commit, false) {
-                // Leave the index as it was: drop the intent-to-add entries made above.
-                if !registered.is_empty() {
-                    let mut undo = vec!["rm", "--cached", "--quiet", "--"];
-                    undo.extend(registered.iter().map(String::as_str));
-                    let _ = self.git_ok(&undo, false);
-                }
-                return Err(error);
-            }
-            let commit = self.git_ok(&["log", "-1", "--format=%h %s"], true)?;
-            return Ok(json!({"ok": true, "commit": commit.trim(), "branch": branch}));
         }
-        self.git_ok(&commit, false)?;
+        if let Some(branch) = branch {
+            run(&["switch", "--create", branch])?;
+        }
+        if let Err(error) = run(&commit) {
+            if branch.is_some() {
+                let rollback = self.restore_commit_branch(snapshot, &expected_ref);
+                if let Err(rollback) = rollback {
+                    bail!("{error:#}. Original staging is intact. Check the current branch before retrying: {rollback:#}");
+                }
+            }
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&shadow, &index) {
+            let saved_index = directory.keep().join("index");
+            bail!("Git created the commit, but updating the index failed: {error}. The committed index is preserved at {}. Check git status before retrying.", saved_index.display());
+        }
         let commit = self.git_ok(&["log", "-1", "--format=%h %s"], true)?;
         Ok(json!({"ok": true, "commit": commit.trim(), "branch": branch}))
+    }
+
+    fn restore_commit_branch(&self, snapshot: &GitCommitSnapshot, created: &str) -> Result<()> {
+        let current = self.git_ok(&["symbolic-ref","-q","HEAD"], false)?;
+        if current.trim_end() != created {
+            bail!("HEAD has since changed; both branches were preserved");
+        }
+        for reference in ["HEAD", snapshot.head_ref.as_str()] {
+            let value = self.git(&["rev-parse","--verify","-q",reference], false)?;
+            let valid = if snapshot.head.is_empty() {
+                value.exit_code == Some(1)
+            } else {
+                value.exit_code == Some(0) && value.stdout.trim_end() == snapshot.head
+            };
+            if !valid {
+                bail!("A branch tip changed; the checkout was preserved");
+            }
+        }
+        // Both branches still point at the same commit. Nothing in the working
+        // tree needs to be checked out; preserve edits made during approval.
+        if snapshot.head_ref == "HEAD" {
+            self.git_ok(&["update-ref","--no-deref","HEAD",&snapshot.head,&snapshot.head], false)?;
+        } else {
+            self.git_ok(&["symbolic-ref","HEAD",&snapshot.head_ref], false)?;
+        }
+        if !snapshot.head.is_empty() {
+            self.git_ok(&["update-ref","-d",created,&snapshot.head], false)?;
+        }
+        Ok(())
     }
 }
 
@@ -384,11 +523,40 @@ mod tests {
     }
 
     #[test]
+    fn approval_rejects_new_files_same_size_edits_and_branch_or_head_changes() {
+        let (dir, _backups, engine) = repo();
+        let prepare = || match engine.prepare("git_commit", &json!({"message":"reviewed"})).unwrap() {
+            PreparedTool::Approval(a) => a,
+            _ => panic!("expected approval"),
+        };
+        fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        let preview = prepare();
+        fs::write(dir.path().join("later.txt"), "later").unwrap();
+        assert!(engine.approve(&preview).is_err());
+        assert_eq!(engine.git_ok(&["diff", "--cached", "--name-only"], true).unwrap(), "");
+        let preview = prepare();
+        fs::write(dir.path().join("later.txt"), "other").unwrap();
+        assert!(engine.approve(&preview).is_err());
+        let preview = prepare();
+        git(dir.path(), &["switch","--create","other"]);
+        assert!(engine.approve(&preview).is_err());
+        let preview = prepare();
+        git(dir.path(), &["commit","--allow-empty","-qm","advance HEAD"]);
+        assert!(engine.approve(&preview).is_err());
+    }
+
+    #[test]
     fn a_failed_selected_commit_leaves_no_intent_to_add_entries() {
         let (dir, _backups, engine) = repo();
         std::fs::write(dir.path().join("new.txt"), "new file").unwrap();
-        let paths = vec!["new.txt".to_string(), "never-existed.txt".to_string()];
-        assert!(engine.execute_git_commit("fails", &paths, None).is_err());
+        let PreparedTool::Approval(action) = engine.prepare(
+            "git_commit", &json!({"message":"fails","paths":["new.txt"],"branch":"attempt"})
+        ).unwrap() else { panic!("expected preview") };
+        git(dir.path(), &["config","user.name",""]);
+        git(dir.path(), &["config","user.email",""]);
+        assert!(engine.approve(&action).is_err());
+        assert_eq!(engine.git_ok(&["symbolic-ref","--short","HEAD"], true).unwrap().trim(), "main");
+        assert!(engine.git_ok(&["branch","--list","attempt"], true).unwrap().is_empty());
         assert_eq!(engine.git_ok(&["ls-files", "--cached", "--", "new.txt"], true).unwrap(), "");
         assert!(dir.path().join("new.txt").exists());
     }

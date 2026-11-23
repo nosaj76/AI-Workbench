@@ -81,8 +81,9 @@ pub struct SourceQuery<'a> {
 pub struct SourceFile {
     pub path: String,
     pub size: u64,
-    /// Modification time in seconds since the epoch.
-    pub modified: u64,
+    pub modified: Option<std::time::SystemTime>,
+    /// Inode and ctime detect replacement or an editor preserving mtime.
+    pub change: Option<(u64, i64, i64)>,
 }
 
 /// Result of `Workspace::source_files`.
@@ -329,15 +330,19 @@ impl Workspace {
             if self.resolve(&relative, false).is_err() {
                 continue;
             }
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
+            let modified = meta.modified().ok();
+            #[cfg(unix)]
+            let change = {
+                use std::os::unix::fs::MetadataExt;
+                Some((meta.ino(), meta.ctime(), meta.ctime_nsec()))
+            };
+            #[cfg(not(unix))]
+            let change = None;
             listing.files.push(SourceFile {
                 path: relative,
                 size: meta.len(),
                 modified,
+                change,
             });
         }
         Ok(listing)

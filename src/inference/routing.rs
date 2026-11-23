@@ -621,23 +621,50 @@ pub async fn route(
     } else {
         Vec::new()
     };
-    if !failed.is_empty() {
-        if let Ok(decision) = route_for_task_excluding(
+    let candidates = inventory(settings, client, dir, cancel).await?;
+    let config = config(settings)?;
+    if let Some(previous) = settings.conversation_model.as_deref() {
+        if let Some(candidate) = candidates.iter().find(|candidate| {
+            canonical_model_name(&candidate.model.name) == canonical_model_name(previous)
+        }) {
+            // Continuity is a preference, subject to today's capability, size,
+            // parameter, privacy and verified native-tool requirements.
+            if let Ok(mut decision) = choose_excluding(
+                &config,
+                task,
+                need_tools,
+                settings.allow_remote,
+                selected,
+                &failed,
+                std::slice::from_ref(candidate),
+            ) {
+                decision.reason = format!(
+                    "Keeping {} for this conversation. {}",
+                    decision.model, decision.reason
+                );
+                record_decision(dir, &decision)?;
+                return Ok(decision);
+            }
+        }
+    }
+    let select = |excluded: &[String]| {
+        route_from_candidates(
             settings,
-            client,
+            &config,
             task,
             need_tools,
             selected,
-            &failed,
+            excluded,
             dir,
-            cancel.clone(),
+            &candidates,
         )
-        .await
-        {
+    };
+    if !failed.is_empty() {
+        if let Ok(decision) = select(&failed) {
             return Ok(decision);
         }
     }
-    route_for_task(settings, client, task, need_tools, selected, dir, cancel).await
+    select(&[])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,23 +706,40 @@ pub async fn route_for_task_excluding(
 ) -> Result<RouteDecision> {
     let config = config(settings)?;
     let candidates = inventory(settings, client, dir, cancel).await?;
-    let mut decision = choose_excluding(
+    route_from_candidates(
+        settings,
         &config,
+        task,
+        need_tools,
+        selected,
+        excluded,
+        dir,
+        &candidates,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_from_candidates(
+    settings: &Settings,
+    config: &RoutingConfig,
+    task: TaskKind,
+    need_tools: bool,
+    selected: &str,
+    excluded: &[String],
+    dir: &Path,
+    candidates: &[ModelCandidate],
+) -> Result<RouteDecision> {
+    let mut decision = choose_excluding(
+        config,
         task,
         need_tools,
         settings.allow_remote,
         selected,
         excluded,
-        &candidates,
+        candidates,
     )?;
     match crate::benchmarks::choose_measured(
-        settings,
-        &config,
-        task,
-        need_tools,
-        excluded,
-        &candidates,
-        dir,
+        settings, config, task, need_tools, excluded, candidates, dir,
     ) {
         Ok(Some(measured)) => decision = measured,
         Ok(None) => {

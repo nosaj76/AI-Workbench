@@ -2,17 +2,21 @@
 use super::*;
 
 impl AdvancedUi {
-    pub(super) fn refresh_review(&mut self, workspace: &Path) {
+    pub(super) fn refresh_review(&mut self, workspace: &Path, settings: &Settings) {
         let root = workspace.to_path_buf();
         let db = self.dir.join("review.sqlite3");
-        let chunk = self.review_chunk;
+        let mut request = ReviewRequest::new(
+            settings.clone(), root.clone(), self.dir.clone(), settings.active_model().into(),
+        );
+        request.instruction = self.review_instruction.clone();
+        request.chunk_chars = self.review_chunk;
         let results = self.sender.clone();
         self.start(
             "Scanning every eligible workspace file…",
             move |events, cancel| {
                 let workspace = Workspace::new(root)?;
                 let mut queue = ReviewQueue::open(db)?;
-                let stats = queue.refresh_with_events(&workspace, chunk, &cancel, &events)?;
+                let stats = queue.refresh_for_review(&workspace, &request, &cancel, &events)?;
                 let coverage = queue.coverage(&workspace)?;
                 let report = format!(
                     "# Review manifest\n\n{}\n\nScan details:\n```json\n{}\n```",
@@ -22,6 +26,7 @@ impl AdvancedUi {
                 let items = queue.items(&workspace, None, 500)?;
                 results.send(UiEvent::Reviews {
                     root: workspace.root().to_path_buf(),
+                    identity: request.identity(),
                     coverage,
                     items,
                 })?;
@@ -58,12 +63,20 @@ impl AdvancedUi {
             ui.label("Batch limit (0 = complete queue)");
             ui.add(egui::DragValue::new(&mut self.review_batch).range(0..=10000));
         });
+        let current_identity = ReviewRequest::objective_identity(
+            &self.review_instruction, settings.active_model(), &settings.base_url,
+        );
+        if self.review_result_identity != current_identity {
+            self.review_items.clear();
+            self.review_selected.clear();
+            self.review_coverage = None;
+        }
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!self.busy, egui::Button::new("Build / refresh manifest"))
                 .clicked()
             {
-                self.refresh_review(workspace);
+                self.refresh_review(workspace, settings);
             }
             if ui
                 .add_enabled(!self.busy, egui::Button::new("Run / resume review"))
@@ -82,12 +95,14 @@ impl AdvancedUi {
                 let dir = self.dir.clone();
                 let root = workspace.to_path_buf();
                 self.start("Reviewing pending file chunks…", move |tx, cancel| {
+                    let identity = req.identity();
                     let run = review_queue::run_review(req, tx, cancel)?;
                     let ws = Workspace::new(root)?;
                     let q = ReviewQueue::open(dir.join("review.sqlite3"))?;
                     let items = q.items(&ws, None, 500)?;
                     events.send(UiEvent::Reviews {
                         root: ws.root().to_path_buf(),
+                        identity,
                         coverage: run.coverage,
                         items,
                     })?;
@@ -106,7 +121,7 @@ impl AdvancedUi {
                 if let Err(e) = result {
                     self.error = Some(e.to_string());
                 } else {
-                    self.refresh_review(workspace);
+                    self.refresh_review(workspace, settings);
                 }
             }
         });
@@ -190,7 +205,7 @@ impl AdvancedUi {
                     if let Err(e) = result {
                         self.error = Some(e.to_string());
                     } else {
-                        self.refresh_review(workspace);
+                        self.refresh_review(workspace, settings);
                     }
                 }
             });
