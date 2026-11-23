@@ -42,7 +42,12 @@ impl TerminalProcess {
                 };
                 drop(command); // release the spawning side's slave descriptors
                 let _ = started.send(Ok(child.id()));
-                let result = supervise(&mut child, &requests, &master);
+                // The worker owns the only Child handle. Always reap it and
+                // publish an exit status, even if a platform call panics.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    supervise(&mut child, &requests, &master)
+                }))
+                .unwrap_or_else(|_| Err(io::Error::other("Terminal supervisor panicked")));
                 if result.is_err() {
                     let _ = child.kill();
                 }
@@ -175,7 +180,6 @@ fn wait_for_exit(pid: Pid, options: rustix::process::WaitIdOptions) -> io::Resul
 
 #[cfg(target_os = "linux")]
 fn stop_session_jobs(sid: Pid) -> io::Result<()> {
-    use rustix::process::getsid;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let mut signalled = false;
@@ -189,7 +193,7 @@ fn stop_session_jobs(sid: Pid) -> io::Result<()> {
             else {
                 continue;
             };
-            if pid == sid || getsid(Some(pid)) != Ok(sid) {
+            if pid == sid || !in_session(pid, sid) {
                 continue;
             }
             match stop_member(pid, sid) {
@@ -212,13 +216,20 @@ fn stop_session_jobs(sid: Pid) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn in_session(pid: Pid, sid: Pid) -> bool {
+    // A kernel task or a task whose session leader is outside this PID
+    // namespace can have SID zero. It is not a positive userspace Pid.
+    let actual = unsafe { libc::getsid(pid.as_raw_pid()) };
+    actual == sid.as_raw_pid()
+}
+
+#[cfg(target_os = "linux")]
 fn stop_member(pid: Pid, sid: Pid) -> rustix::io::Result<bool> {
-    use rustix::process::{getsid, pidfd_open, pidfd_send_signal, PidfdFlags};
+    use rustix::process::{pidfd_open, pidfd_send_signal, PidfdFlags};
     let fd = pidfd_open(pid, PidfdFlags::empty())?;
     // Recheck after opening the stable handle. A readable pidfd already exited.
     let mut ready = [PollFd::new(&fd, PollFlags::IN)];
-    if getsid(Some(pid))? != sid
-        || retry_on_intr(|| poll(&mut ready, Some(&Timespec::default())))? != 0
+    if !in_session(pid, sid) || retry_on_intr(|| poll(&mut ready, Some(&Timespec::default())))? != 0
     {
         return Ok(false);
     }
